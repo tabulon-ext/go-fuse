@@ -1,3 +1,5 @@
+//go:build linux
+
 // Copyright 2016 the Go-FUSE Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
@@ -8,9 +10,9 @@ package splice
 
 import (
 	"fmt"
-	"io/ioutil"
 	"log"
 	"os"
+	"sync"
 	"syscall"
 )
 
@@ -30,11 +32,13 @@ func MaxPipeSize() int {
 // Since Linux 2.6.11, the pipe capacity is 65536 bytes.
 const DefaultPipeSize = 16 * 4096
 
-// We empty pipes by splicing to /dev/null.
-var devNullFD uintptr
+var (
+	devNullFDOnce  sync.Once
+	devNullFDValue int
+)
 
 func init() {
-	content, err := ioutil.ReadFile("/proc/sys/fs/pipe-max-size")
+	content, err := os.ReadFile("/proc/sys/fs/pipe-max-size")
 	if err != nil {
 		maxPipeSize = DefaultPipeSize
 	} else {
@@ -51,13 +55,18 @@ func init() {
 	resizable = resizable && (errNo == 0)
 	r.Close()
 	w.Close()
+}
 
-	fd, err := syscall.Open("/dev/null", os.O_WRONLY, 0)
-	if err != nil {
-		log.Panicf("splice: %v", err)
-	}
-
-	devNullFD = uintptr(fd)
+// We empty pipes by splicing to /dev/null.
+func devNullFD() int {
+	devNullFDOnce.Do(func() {
+		fd, err := syscall.Open("/dev/null", os.O_WRONLY, 0)
+		if err != nil {
+			panic(fmt.Sprintf("failed to open /dev/null: %s", err))
+		}
+		devNullFDValue = fd
+	})
+	return devNullFDValue
 }
 
 // copy & paste from syscall.
@@ -71,21 +80,29 @@ func fcntl(fd uintptr, cmd int, arg int) (val int, errno syscall.Errno) {
 const F_SETPIPE_SZ = 1031
 const F_GETPIPE_SZ = 1032
 
-func osPipe() (int, int, error) {
-	var fds [2]int
-	err := syscall.Pipe2(fds[:], syscall.O_NONBLOCK)
-	return fds[0], fds[1], err
-}
-
 func newSplicePair() (p *Pair, err error) {
 	p = &Pair{}
-	p.r, p.w, err = osPipe()
+	p.r, p.w, err = os.Pipe()
 	if err != nil {
 		return nil, err
 	}
+	p.rConn, err = p.r.SyscallConn()
+	if err != nil {
+		p.r.Close()
+		p.w.Close()
+		return nil, err
+	}
+	p.wConn, err = p.w.SyscallConn()
+	if err != nil {
+		p.r.Close()
+		p.w.Close()
+		return nil, err
+	}
 	var errNo syscall.Errno
-	p.size, errNo = fcntl(uintptr(p.r), F_GETPIPE_SZ, 0)
-	if err == syscall.EINVAL {
+	p.rConn.Control(func(fd uintptr) {
+		p.size, errNo = fcntl(fd, F_GETPIPE_SZ, 0)
+	})
+	if errNo == syscall.EINVAL {
 		p.size = DefaultPipeSize
 		return p, nil
 	}

@@ -7,49 +7,88 @@ package posixtest
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
+	"sync"
 	"syscall"
 	"testing"
 
 	"github.com/hanwen/go-fuse/v2/fuse"
+	"github.com/hanwen/go-fuse/v2/internal/fallocate"
+	"github.com/hanwen/go-fuse/v2/internal/xattr"
 	"golang.org/x/sys/unix"
 )
 
 // All holds a map of all test functions
 var All = map[string]func(*testing.T, string){
 	"AppendWrite":                AppendWrite,
-	"SymlinkReadlink":            SymlinkReadlink,
-	"FileBasic":                  FileBasic,
-	"TruncateFile":               TruncateFile,
-	"TruncateNoFile":             TruncateNoFile,
+	"DirSeek":                    DirSeek,
+	"DirectIO":                   DirectIO,
+	"Fallocate":                  Fallocate,
+	"FcntlFlockLocksFile":        FcntlFlockLocksFile,
+	"FcntlFlockSetLk":            FcntlFlockSetLk,
 	"FdLeak":                     FdLeak,
-	"MkdirRmdir":                 MkdirRmdir,
-	"NlinkZero":                  NlinkZero,
+	"FileBasic":                  FileBasic,
+	"FileLarge":                  FileLarge,
 	"FstatDeleted":               FstatDeleted,
-	"ParallelFileOpen":           ParallelFileOpen,
 	"Link":                       Link,
 	"LinkUnlinkRename":           LinkUnlinkRename,
+	"LseekEnxioCheck":            LseekEnxioCheck,
 	"LseekHoleSeeksToEOF":        LseekHoleSeeksToEOF,
-	"RenameOverwriteDestNoExist": RenameOverwriteDestNoExist,
-	"RenameOverwriteDestExist":   RenameOverwriteDestExist,
-	"RenameOpenDir":              RenameOpenDir,
-	"ReadDir":                    ReadDir,
-	"ReadDirPicksUpCreate":       ReadDirPicksUpCreate,
-	"DirectIO":                   DirectIO,
+	"MkdirRmdir":                 MkdirRmdir,
+	"NlinkZero":                  NlinkZero,
 	"OpenAt":                     OpenAt,
-	"Fallocate":                  Fallocate,
-	"DirSeek":                    DirSeek,
-	"FcntlFlockSetLk":            FcntlFlockSetLk,
-	"FcntlFlockLocksFile":        FcntlFlockLocksFile,
+	"OpenSymlinkRace":            OpenSymlinkRace,
+	"ParallelFileOpen":           ParallelFileOpen,
+	"ReadDirBasic":               ReadDirBasic,
+	"ReadDirConsistency":         ReadDirConsistency,
+	"RenameOpenDir":              RenameOpenDir,
+	"RenameOverwriteDestExist":   RenameOverwriteDestExist,
+	"RenameOverwriteDestNoExist": RenameOverwriteDestNoExist,
+	"SetattrSymlink":             SetattrSymlink,
+	"SymlinkReadlink":            SymlinkReadlink,
+	"TruncateFile":               TruncateFile,
+	"TruncateNoFile":             TruncateNoFile,
+	"XAttr":                      XAttr,
+	"XAttrLarge":                 XAttrLarge,
+}
+
+func SetattrSymlink(t *testing.T, mnt string) {
+	l := filepath.Join(mnt, "link")
+	if err := os.Symlink("doesnotexist", l); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+
+	tvs := []unix.Timeval{
+		{Sec: 42, Usec: 1},
+		{Sec: 43, Usec: 2},
+	}
+	if err := unix.Lutimes(l, tvs); err != nil {
+		t.Fatalf("Lutimes: %v", err)
+	}
+
+	var st unix.Stat_t
+	if err := unix.Lstat(l, &st); err != nil {
+		t.Fatalf("Lstat: %v", err)
+	}
+
+	if st.Mtim.Sec != 43 {
+		// Can't check atime; it's hard to prevent implicit readlink calls.
+		t.Fatalf("got mtime %v, want 43", st.Mtim)
+	}
 }
 
 func DirectIO(t *testing.T, mnt string) {
+	if o_DIRECT == 0 {
+		t.Skip("platform has no O_DIRECT")
+	}
 	fn := mnt + "/file.txt"
-	fd, err := syscall.Open(fn, syscall.O_TRUNC|syscall.O_CREAT|syscall.O_DIRECT|syscall.O_WRONLY, 0644)
+	fd, err := syscall.Open(fn, syscall.O_TRUNC|syscall.O_CREAT|o_DIRECT|syscall.O_WRONLY, 0644)
 	if err == syscall.EINVAL {
 		t.Skip("FS does not support O_DIRECT")
 	}
@@ -71,7 +110,7 @@ func DirectIO(t *testing.T, mnt string) {
 	if err != nil {
 		t.Fatalf("Close: %v", err)
 	}
-	fd, err = syscall.Open(fn, syscall.O_DIRECT|syscall.O_RDONLY, 0644)
+	fd, err = syscall.Open(fn, o_DIRECT|syscall.O_RDONLY, 0644)
 	if err != nil {
 		t.Fatalf("Open 2: %v", err)
 	}
@@ -88,18 +127,19 @@ func DirectIO(t *testing.T, mnt string) {
 
 // SymlinkReadlink tests basic symlink functionality
 func SymlinkReadlink(t *testing.T, mnt string) {
-	err := os.Symlink("/foobar", mnt+"/link")
+	target := "/foobar"
+	err := os.Symlink(target, mnt+"/link")
 	if err != nil {
 		t.Fatalf("Symlink: %v", err)
 	}
 
-	val, err := os.Readlink(mnt + "/link")
+	got, err := os.Readlink(mnt + "/link")
 	if err != nil {
 		t.Fatalf("Readlink: %v", err)
 	}
 
-	if val != "/foobar" {
-		t.Errorf("symlink mismatch: %v", val)
+	if got != target {
+		t.Errorf("got %q want %q", got, target)
 	}
 }
 
@@ -107,11 +147,11 @@ func FileBasic(t *testing.T, mnt string) {
 	content := []byte("hello world")
 	fn := mnt + "/file"
 
-	if err := ioutil.WriteFile(fn, content, 0755); err != nil {
+	if err := os.WriteFile(fn, content, 0755); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
 
-	if got, err := ioutil.ReadFile(fn); err != nil {
+	if got, err := os.ReadFile(fn); err != nil {
 		t.Fatalf("ReadFile: %v", err)
 	} else if bytes.Compare(got, content) != 0 {
 		t.Errorf("ReadFile: got %q, want %q", got, content)
@@ -141,10 +181,58 @@ func FileBasic(t *testing.T, mnt string) {
 	}
 }
 
+func largeContent() []byte {
+	content := make([]byte, 128<<10+123)
+	for i := range content {
+		content[i] = byte(i * 7 / 3)
+	}
+	return content
+}
+
+func FileLarge(t *testing.T, mnt string) {
+	content := largeContent()
+	fn := mnt + "/file"
+
+	f, err := os.Create(fn)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if n, err := f.Write(content); err != nil || n != len(content) {
+		t.Fatalf("Write: %d, %v", n, err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	f, err = os.Open(fn)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer f.Close()
+
+	// Short read at EOF.
+	buf := make([]byte, len(content)+1000)
+	n, err := io.ReadFull(f, buf)
+	if err != io.ErrUnexpectedEOF {
+		t.Fatalf("ReadFull: %d, %v", n, err)
+	}
+	if !bytes.Equal(buf[:n], content) {
+		t.Errorf("Read: got %d bytes, want %d", n, len(content))
+	}
+
+	off := 4096 + 7
+	buf = make([]byte, 64<<10+5)
+	if n, err := f.ReadAt(buf, int64(off)); err != nil {
+		t.Fatalf("ReadAt: %d, %v", n, err)
+	} else if !bytes.Equal(buf, content[off:off+len(buf)]) {
+		t.Errorf("ReadAt: data mismatch")
+	}
+}
+
 func TruncateFile(t *testing.T, mnt string) {
 	content := []byte("hello world")
 	fn := mnt + "/file"
-	if err := ioutil.WriteFile(fn, content, 0755); err != nil {
+	if err := os.WriteFile(fn, content, 0755); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
 
@@ -163,7 +251,7 @@ func TruncateFile(t *testing.T, mnt string) {
 		t.Errorf("Close: %v", err)
 	}
 
-	if got, err := ioutil.ReadFile(fn); err != nil {
+	if got, err := os.ReadFile(fn); err != nil {
 		t.Fatalf("ReadFile: %v", err)
 	} else if want := content[:trunc]; bytes.Compare(got, want) != 0 {
 		t.Errorf("got %q, want %q", got, want)
@@ -171,7 +259,7 @@ func TruncateFile(t *testing.T, mnt string) {
 }
 func TruncateNoFile(t *testing.T, mnt string) {
 	fn := mnt + "/file"
-	if err := ioutil.WriteFile(fn, []byte("hello"), 0644); err != nil {
+	if err := os.WriteFile(fn, []byte("hello"), 0644); err != nil {
 		t.Errorf("WriteFile: %v", err)
 	}
 
@@ -188,22 +276,38 @@ func TruncateNoFile(t *testing.T, mnt string) {
 }
 
 func FdLeak(t *testing.T, mnt string) {
+	var before []string
+	if runtime.GOOS == "linux" {
+		before = listFds(0, "")
+	}
+
 	fn := mnt + "/file"
 
-	if err := ioutil.WriteFile(fn, []byte("hello world"), 0755); err != nil {
+	if err := os.WriteFile(fn, []byte("hello world"), 0755); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
 
 	for i := 0; i < 100; i++ {
-		if _, err := ioutil.ReadFile(fn); err != nil {
+		if _, err := os.ReadFile(fn); err != nil {
 			t.Fatalf("ReadFile: %v", err)
 		}
 	}
 
 	if runtime.GOOS == "linux" {
-		infos := listFds(0, "")
-		if len(infos) > 15 {
-			t.Errorf("found %d open file descriptors for 100x ReadFile: %v", len(infos), infos)
+		after := listFds(0, "")
+		asmap := map[string]bool{}
+		for _, b := range before {
+			asmap[b] = true
+		}
+
+		filtered := []string{}
+		for _, a := range after {
+			if !asmap[a] {
+				filtered = append(filtered, a)
+			}
+		}
+		if len(filtered) > 15 {
+			t.Errorf("found %d open file descriptors for 100x ReadFile: %v", len(filtered), filtered)
 		}
 	}
 }
@@ -229,11 +333,11 @@ func MkdirRmdir(t *testing.T, mnt string) {
 func NlinkZero(t *testing.T, mnt string) {
 	src := mnt + "/src"
 	dst := mnt + "/dst"
-	if err := ioutil.WriteFile(src, []byte("source"), 0644); err != nil {
+	if err := os.WriteFile(src, []byte("source"), 0644); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
 
-	if err := ioutil.WriteFile(dst, []byte("dst"), 0644); err != nil {
+	if err := os.WriteFile(dst, []byte("dst"), 0644); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
 
@@ -270,22 +374,24 @@ func FstatDeleted(t *testing.T, mnt string) {
 	const iMax = 9
 	type file struct {
 		fd int
-		st syscall.Stat_t
+		st unix.Stat_t
 	}
 	files := make(map[int]file)
 	for i := 0; i <= iMax; i++ {
 		// Create files with different sizes
 		path := fmt.Sprintf("%s/%d", mnt, i)
 		content := make([]byte, i)
-		err := ioutil.WriteFile(path, content, 0644)
+		err := os.WriteFile(path, content, 0644)
 		if err != nil {
 			t.Fatalf("WriteFile: %v", err)
 		}
-		var st syscall.Stat_t
-		err = syscall.Stat(path, &st)
+		var st unix.Stat_t
+		err = unix.Stat(path, &st)
 		if err != nil {
 			t.Fatal(err)
 		}
+		clearStatRevision(&st)
+
 		// Open
 		fd, err := syscall.Open(path, syscall.O_RDONLY, 0)
 		if err != nil {
@@ -301,26 +407,27 @@ func FstatDeleted(t *testing.T, mnt string) {
 	}
 	// Fstat in random order
 	for _, v := range files {
-		var st syscall.Stat_t
-		err := syscall.Fstat(v.fd, &st)
+		var st unix.Stat_t
+		err := unix.Fstat(v.fd, &st)
 		if err != nil {
 			t.Fatal(err)
 		}
 		// Ignore ctime, changes on unlink
-		v.st.Ctim = syscall.Timespec{}
-		st.Ctim = syscall.Timespec{}
+		v.st.Ctim = unix.Timespec{}
+		st.Ctim = unix.Timespec{}
 		// Nlink value should have dropped to zero
 		v.st.Nlink = 0
+		clearStatRevision(&st)
 		// Rest should stay the same
 		if v.st != st {
-			t.Errorf("stat mismatch: want=%v\n have=%v", v.st, st)
+			t.Errorf("stat mismatch:\n  got=%#v\n want=%#v", st, v.st)
 		}
 	}
 }
 
 func ParallelFileOpen(t *testing.T, mnt string) {
 	fn := mnt + "/file"
-	if err := ioutil.WriteFile(fn, []byte("content"), 0644); err != nil {
+	if err := os.WriteFile(fn, []byte("content"), 0644); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
 
@@ -354,7 +461,7 @@ func Link(t *testing.T, mnt string) {
 	link := mnt + "/link"
 	target := mnt + "/target"
 
-	if err := ioutil.WriteFile(target, []byte("hello"), 0644); err != nil {
+	if err := os.WriteFile(target, []byte("hello"), 0644); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
 
@@ -393,12 +500,12 @@ func RenameOverwrite(t *testing.T, mnt string, destExists bool) {
 	if err := os.Mkdir(mnt+"/dir", 0755); err != nil {
 		t.Fatalf("Mkdir: %v", err)
 	}
-	if err := ioutil.WriteFile(mnt+"/file", []byte("hello"), 0644); err != nil {
+	if err := os.WriteFile(mnt+"/file", []byte("hello"), 0644); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
 
 	if destExists {
-		if err := ioutil.WriteFile(mnt+"/dir/renamed", []byte("xx"), 0644); err != nil {
+		if err := os.WriteFile(mnt+"/dir/renamed", []byte("xx"), 0644); err != nil {
 			t.Fatalf("WriteFile dest: %v", err)
 		}
 	}
@@ -464,16 +571,38 @@ func RenameOpenDir(t *testing.T, mnt string) {
 	}
 }
 
+func readAllDirEntries(fd int) ([]fuse.DirEntry, error) {
+	var buf [4096]byte
+	var result []fuse.DirEntry
+	for {
+		n, err := unix.ReadDirent(fd, buf[:])
+		if err != nil {
+			return nil, err
+		}
+		if n == 0 {
+			break
+		}
+		todo := buf[:n]
+		for len(todo) > 0 {
+			var de fuse.DirEntry
+			n := de.Parse(todo)
+			todo = todo[n:]
+			result = append(result, de)
+		}
+	}
+	return result, nil
+}
+
 // ReadDir creates 110 files one by one, checking that we get the expected
 // entries after each file creation.
-func ReadDir(t *testing.T, mnt string) {
+func ReadDirBasic(t *testing.T, mnt string) {
 	want := map[string]bool{}
 	// 40 bytes of filename, so 110 entries overflows a
 	// 4096 page.
 	for i := 0; i < 110; i++ {
 		nm := fmt.Sprintf("file%036x", i)
 		want[nm] = true
-		if err := ioutil.WriteFile(filepath.Join(mnt, nm), []byte("hello"), 0644); err != nil {
+		if err := os.WriteFile(filepath.Join(mnt, nm), []byte("hello"), 0644); err != nil {
 			t.Fatalf("WriteFile %q: %v", nm, err)
 		}
 		// Verify that we get the expected entries
@@ -506,24 +635,24 @@ func ReadDir(t *testing.T, mnt string) {
 	}
 }
 
-// Readdir should pick file created after open, but before readdir.
-func ReadDirPicksUpCreate(t *testing.T, mnt string) {
-	f, err := os.Open(mnt)
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
+// Creates files, read them back using readdir
+func ReadDirConsistency(t *testing.T, mnt string) {
+	var results [][]fuse.DirEntry
+	for i := 0; i < 2; i++ {
+		fd, err := syscall.Open(mnt, syscall.O_DIRECTORY, 0)
+		if err != nil {
+			t.Fatalf("Open: %v", err)
+		}
+		defer syscall.Close(fd)
 
-	if err := ioutil.WriteFile(mnt+"/file", []byte{42}, 0644); err != nil {
-		t.Fatalf("WriteFile: %v", err)
+		r, err := readAllDirEntries(fd)
+		if err != nil {
+			t.Fatalf("ReadDir: %v", err)
+		}
+		results = append(results, r)
 	}
-	names, err := f.Readdirnames(-1)
-	if err != nil {
-		t.Fatalf("ReadDir: %v", err)
-	}
-	f.Close()
-
-	if len(names) != 1 || names[0] != "file" {
-		t.Errorf("missing file created after opendir")
+	if !reflect.DeepEqual(results[0], results[1]) {
+		t.Errorf("got %v, want %v", results[0], results[1])
 	}
 }
 
@@ -531,7 +660,7 @@ func ReadDirPicksUpCreate(t *testing.T, mnt string) {
 func LinkUnlinkRename(t *testing.T, mnt string) {
 	content := []byte("hello")
 	tmp := mnt + "/tmpfile"
-	if err := ioutil.WriteFile(tmp, content, 0644); err != nil {
+	if err := os.WriteFile(tmp, content, 0644); err != nil {
 		t.Fatalf("WriteFile %q: %v", tmp, err)
 	}
 
@@ -543,7 +672,7 @@ func LinkUnlinkRename(t *testing.T, mnt string) {
 		t.Fatalf("Unlink %q: %v", tmp, err)
 	}
 
-	if back, err := ioutil.ReadFile(dest); err != nil {
+	if back, err := os.ReadFile(dest); err != nil {
 		t.Fatalf("Read %q: %v", dest, err)
 	} else if bytes.Compare(back, content) != 0 {
 		t.Fatalf("Read got %q want %q", back, content)
@@ -575,7 +704,7 @@ func AppendWrite(t *testing.T, mnt string) {
 	fd = 0
 	want := []byte("helloworld")
 
-	got, err := ioutil.ReadFile(mnt + "/file")
+	got, err := os.ReadFile(mnt + "/file")
 	if err != nil {
 		t.Fatalf("ReadFile: %v", err)
 	}
@@ -605,7 +734,7 @@ func OpenAt(t *testing.T, mnt string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	fd, err := syscall.Openat(dirfd, "file1", syscall.O_CREAT, 0700)
+	fd, err := unix.Openat(dirfd, "file1", syscall.O_CREAT, 0700)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -622,8 +751,10 @@ func Fallocate(t *testing.T, mnt string) {
 		t.Fatalf("OpenFile failed: %v", err)
 	}
 	defer rwFile.Close()
-	err = syscall.Fallocate(int(rwFile.Fd()), 0, 1024, 4096)
-	if err != nil {
+	err = fallocate.Fallocate(int(rwFile.Fd()), 0, 1024, 4096)
+	if err == syscall.EOPNOTSUPP {
+		t.Skipf("Fallocate: %v", err)
+	} else if err != nil {
 		t.Fatalf("Fallocate failed: %v", err)
 	}
 	fi, err := os.Lstat(mnt + "/file")
@@ -659,17 +790,21 @@ func FcntlFlockSetLk(t *testing.T, mnt string) {
 		}
 		defer f2.Close()
 		lk := syscall.Flock_t{}
-		if err := syscall.FcntlFlock(f2.Fd(), unix.F_OFD_GETLK, &lk); err != nil {
+		if err := sysFcntlFlockGetOFDLock(f2.Fd(), &lk); errors.Is(err, errors.ErrUnsupported) {
+			t.Skipf("FcntlFlock: %v", err)
+		} else if err != nil {
 			t.Errorf("FcntlFlock failed: %v", err)
 		}
 		if lk.Type != syscall.F_WRLCK {
 			t.Errorf("got lk.Type=%v, want %v", lk.Type, syscall.F_WRLCK)
-
 		}
 	}
 }
 
 func FcntlFlockLocksFile(t *testing.T, mnt string) {
+	if kernelLocks {
+		t.Skip("locks of one process do not conflict")
+	}
 	filename := mnt + "/test"
 	f1, err := os.Create(filename)
 	if err != nil {
@@ -701,9 +836,12 @@ func FcntlFlockLocksFile(t *testing.T, mnt string) {
 }
 
 func LseekHoleSeeksToEOF(t *testing.T, mnt string) {
+	if seekHole < 0 {
+		t.Skip("platform has no SEEK_HOLE")
+	}
 	fn := filepath.Join(mnt, "file.bin")
 	content := bytes.Repeat([]byte("abcxyz\n"), 1024)
-	if err := ioutil.WriteFile(fn, content, 0644); err != nil {
+	if err := os.WriteFile(fn, content, 0644); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
 
@@ -713,10 +851,306 @@ func LseekHoleSeeksToEOF(t *testing.T, mnt string) {
 	}
 	defer syscall.Close(fd)
 
-	off, err := unix.Seek(fd, int64(len(content)/2), unix.SEEK_HOLE)
+	off, err := unix.Seek(fd, int64(len(content)/2), seekHole)
 	if err != nil {
 		t.Fatalf("Seek: %v", err)
 	} else if off != int64(len(content)) {
 		t.Errorf("got offset %d, want %d", off, len(content))
 	}
+}
+
+func LseekEnxioCheck(t *testing.T, mnt string) {
+	if seekHole < 0 {
+		t.Skip("platform has no SEEK_HOLE")
+	}
+	fn := filepath.Join(mnt, "file.bin")
+	content := bytes.Repeat([]byte("abcxyz\n"), 1024)
+	if err := os.WriteFile(fn, content, 0644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	fd, err := syscall.Open(fn, syscall.O_RDONLY, 0644)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer syscall.Close(fd)
+
+	testCases := []struct {
+		name   string
+		offset int64
+		whence int
+	}{
+		{
+			name:   "Lseek SEEK_DATA where offset is at EOF returns ENXIO",
+			offset: int64(len(content)),
+			whence: seekData,
+		},
+		{
+			name:   "Lseek SEEK_DATA where offset greater than EOF returns ENXIO",
+			offset: int64(len(content)) + 1,
+			whence: seekData,
+		},
+		{
+			name:   "Lseek SEEK_HOLE where offset is greater than EOF returns ENXIO",
+			offset: int64(len(content)) + 1,
+			whence: seekHole,
+		},
+	}
+
+	for _, tc := range testCases {
+		_, err := unix.Seek(fd, tc.offset, tc.whence)
+		if err != nil {
+			if !errors.Is(err, syscall.ENXIO) {
+				t.Errorf("Failed test case: %s; got %v, want %v", tc.name, err, syscall.ENXIO)
+			}
+		}
+	}
+}
+
+func XAttrLarge(t *testing.T, mntDir string) {
+	attr := "user.large"
+	fn := mntDir + "/file"
+	if err := os.WriteFile(fn, []byte{}, 0666); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	value := largeContent()[:8<<10+123]
+	if err := setxattr(fn, attr, value, 0); err == unix.ENOTSUP || err == unix.ENOSPC || err == unix.E2BIG {
+		t.Skipf("Setxattr: %v; backing filesystem does not support large xattrs", err)
+	} else if err != nil {
+		t.Fatalf("Setxattr: %v", err)
+	}
+
+	sz, err := getxattr(fn, attr, nil)
+	if err != nil {
+		t.Fatalf("Getxattr(nil): %v", err)
+	} else if sz != len(value) {
+		t.Errorf("Getxattr(nil): got %d want %d", sz, len(value))
+	}
+
+	buf := make([]byte, sz)
+	if n, err := getxattr(fn, attr, buf); err != nil {
+		t.Fatalf("Getxattr: %v", err)
+	} else if !bytes.Equal(buf[:n], value) {
+		t.Errorf("Getxattr: got %d bytes, data mismatch", n)
+	}
+}
+
+// XAttr; they aren't posix but cross-platform enough to put into posixtest/
+func XAttr(t *testing.T, mntDir string) {
+	buf := make([]byte, 1024)
+	attrNameSpace := "user"
+	attrName := "xattrtest"
+	attr := fmt.Sprintf("%s.%s", attrNameSpace, attrName)
+	fn := mntDir + "/file"
+
+	if err := os.WriteFile(fn, []byte{}, 0666); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	if n, err := getxattr(fn, attr, buf); err == nil {
+		t.Errorf("got result %q, want empty", buf[:n])
+	} else if err == unix.ENOTSUP {
+		t.Skipf("filesystem for %s does not support xattrs. Rerun this test with a $TMPDIR override", fn)
+	} else if err != xattr.ENOATTR {
+		t.Fatalf("got %v want ENOATTR", err)
+	}
+
+	value := []byte("value")
+	if err := setxattr(fn, attr, value, 0); err != nil {
+		t.Fatalf("Setxattr: %v", err)
+	}
+
+	sz, err := listxattr(fn, nil)
+	if err != nil {
+		t.Fatalf("Listxattr: %v", err)
+	}
+	buf = make([]byte, sz)
+	if _, err := listxattr(fn, buf); err != nil {
+		t.Fatalf("Listxattr: %v", err)
+	} else {
+		attributes := xattr.ParseAttrNames(buf[:sz])
+		found := false
+		for _, a := range attributes {
+			if string(a) == attr || attrNameSpace+"."+string(a) == attr {
+				found = true
+				break
+			}
+		}
+
+		if !found {
+			t.Fatalf("Listxattr: %q (not found: %q)", attributes, attr)
+		}
+	}
+
+	sz, err = getxattr(fn, attr, nil)
+	if err != nil {
+		t.Fatalf("Getxattr(nil): %v", err)
+	} else if sz != len(value) {
+		t.Errorf("Getxattr(nil): got %d want %d", sz, len(value))
+	}
+
+	buf = make([]byte, sz)
+	sz, err = getxattr(fn, attr, buf)
+	if err != nil {
+		t.Fatalf("Getxattr: %v", err)
+	}
+	if !bytes.Equal(buf[:sz], value) {
+		t.Fatalf("Getxattr got %q want %q", buf[:sz], value)
+	}
+	if err := removexattr(fn, attr); err != nil {
+		t.Fatalf("Removexattr: %v", err)
+	}
+
+	if _, err := getxattr(fn, attr, buf); err != xattr.ENOATTR {
+		t.Fatalf("got %v want ENOATTR", err)
+	}
+}
+
+// Test if Open() is vulnerable to symlink-race attacks using two goroutines:
+//
+// goroutine "shuffler":
+// In a loop:
+// * Replace empty file "OpenSymlinkRace" with a symlink pointing to /etc/passwd
+// * Replace back with empty file
+//
+// goroutine "opener":
+// In a loop:
+// * Open "OpenSymlinkRace" and call Fstat on it. Now there's three cases:
+//  1. Size=0: we opened the empty file created by shuffler. Normal and uninteresting.
+//  2. Size>0 but Dev number different: we (this test) opened /etc/passwd ourselves
+//     because we resolved the symlink. Normal.
+//  3. Size>0 and Dev number matches the FUSE mount: go-fuse opened /etc/passwd.
+//     The attack has worked.
+func OpenSymlinkRace(t *testing.T, mnt string) {
+	path := mnt + "/OpenSymlinkRace"
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	const iterations = 1000
+
+	fd, err := unix.Open(path, unix.O_WRONLY|unix.O_CREAT|unix.O_TRUNC, 0600)
+	if err != nil {
+		t.Error(err)
+		return
+	}
+	// Find and save the device number of the FUSE mount
+	var st syscall.Stat_t
+	err = syscall.Fstat(fd, &st)
+	fuseMountDev := st.Dev
+	if err != nil {
+		t.Fatal(err)
+	}
+	syscall.Close(fd)
+
+	// Shuffler
+	go func() {
+		defer wg.Done()
+		tmp := path + ".tmp"
+		for i := 0; i < iterations; i++ {
+			// Stop when another thread has failed
+			if t.Failed() {
+				return
+			}
+
+			// Make "path" a regular file
+			fd, err := unix.Open(tmp, unix.O_WRONLY|unix.O_CREAT|unix.O_TRUNC, 0600)
+			if err != nil {
+				t.Errorf("shuffler: Open: %v", err)
+				return
+			}
+			syscall.Close(fd)
+			err = syscall.Rename(tmp, path)
+			if err != nil {
+				t.Error(err)
+				return
+			}
+
+			// Make "path" a symlink
+			err = syscall.Symlink("/etc/passwd", tmp)
+			if err != nil {
+				t.Errorf("shuffler: Symlink: %v", err)
+				return
+			}
+			err = syscall.Rename(tmp, path)
+			if err != nil {
+				t.Errorf("shuffler: Rename: %v", err)
+				return
+			}
+		}
+	}()
+
+	// Keep some statistics
+	type statsT struct {
+		EINVAL          int
+		ENOENT          int
+		ELOOP           int
+		EIO             int
+		empty           int
+		resolvedSymlink int
+	}
+	var stats statsT
+
+	// Opener
+	go func() {
+		defer wg.Done()
+		var st syscall.Stat_t
+
+		for i := 0; i < iterations; i++ {
+			// Stop when another thread has failed
+			if t.Failed() {
+				return
+			}
+
+			fd, err := syscall.Open(path, syscall.O_RDONLY, 0)
+			if err != nil {
+				if err == syscall.EINVAL {
+					// Happens when the kernel tries to read the symlink but
+					// it's already a file again in the backing directory
+					stats.EINVAL++
+					continue
+				}
+				if err == syscall.ELOOP {
+					// Looks like there's some symlink-safety
+					stats.ELOOP++
+					continue
+				}
+				if err == syscall.ENOENT {
+					// Not sure why we get these, but we do
+					stats.ENOENT++
+					continue
+				}
+				t.Errorf("opener: Open: %v", err)
+				return
+			}
+			err = syscall.Fstat(fd, &st)
+			syscall.Close(fd)
+			if err == syscall.EIO {
+				// Inode reuse has invalidated the
+				// file descriptor. This can happen if
+				// using loopback FUSE over ext4.
+				stats.EIO++
+				continue
+			}
+			if err != nil {
+				t.Errorf("opener: Fstat: %v", err)
+				return
+			}
+			if st.Size == 0 {
+				stats.empty++
+				continue
+			}
+			if st.Dev != fuseMountDev {
+				stats.resolvedSymlink++
+			} else {
+				// opened /etc/passwd
+				t.Errorf("opener: successful symlink attack in iteration %d. We tricked go-fuse into opening /etc/passwd.", i)
+				return
+			}
+		}
+	}()
+
+	wg.Wait()
+	t.Logf("opener stats: %#v", stats)
 }

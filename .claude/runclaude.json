@@ -1,0 +1,8 @@
+{
+    "expose": [ "/dev/kvm", "/dev/fuse" ],
+    "allowDomains": [
+	"*.openbsd.org",
+	"openbsd.org",
+	"*.golang.org"
+    ]
+}

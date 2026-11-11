@@ -1,10 +1,15 @@
 module github.com/hanwen/go-fuse/v2
 
 require (
-	github.com/kylelemons/godebug v0.0.0-20170820004349-d65d576e9348
-	github.com/moby/sys/mountinfo v0.6.2
-	golang.org/x/sync v0.0.0-20201207232520-09787c993a3a
-	golang.org/x/sys v0.0.0-20220520151302-bc2c85ada10a
+	github.com/ebitengine/purego v0.10.0
+	github.com/kylelemons/godebug v1.1.0
+	github.com/moby/sys/mountinfo v0.7.2
+	golang.org/x/sys v0.45.0
 )
 
-go 1.13
+require (
+	github.com/rasky/go-xdr v0.0.0-20170124162913-1a41d1a06c93 // indirect
+	github.com/willscott/go-nfs-client v0.0.0-20240104095149-b44639837b00
+)
+
+go 1.25.0

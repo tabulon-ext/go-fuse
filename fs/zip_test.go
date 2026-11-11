@@ -8,7 +8,6 @@ import (
 	"archive/zip"
 	"bytes"
 	"context"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -53,10 +52,7 @@ type byteReaderAt struct {
 }
 
 func (br *byteReaderAt) ReadAt(data []byte, off int64) (int, error) {
-	end := int(off) + len(data)
-	if end > len(br.b) {
-		end = len(br.b)
-	}
+	end := min(int(off)+len(data), len(br.b))
 
 	copy(data, br.b[off:end])
 	return end - int(off), nil
@@ -88,7 +84,7 @@ func TestZipFS(t *testing.T) {
 			}
 			continue
 		}
-		c, err := ioutil.ReadFile(filepath.Join(mntDir, k))
+		c, err := os.ReadFile(filepath.Join(mntDir, k))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -97,7 +93,7 @@ func TestZipFS(t *testing.T) {
 		}
 	}
 
-	entries, err := ioutil.ReadDir(mntDir)
+	entries, err := os.ReadDir(mntDir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -138,7 +134,7 @@ func TestZipFSOnAdd(t *testing.T) {
 	}
 	defer server.Unmount()
 
-	c, err := ioutil.ReadFile(mnt + "/sub/dir/subdir/subfile")
+	c, err := os.ReadFile(mnt + "/sub/dir/subdir/subfile")
 	if err != nil {
 		t.Fatal("ReadFile", err)
 	}

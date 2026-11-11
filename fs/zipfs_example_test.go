@@ -9,7 +9,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -51,7 +51,7 @@ func (zf *zipFile) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint3
 		if err != nil {
 			return nil, 0, syscall.EIO
 		}
-		content, err := ioutil.ReadAll(rc)
+		content, err := io.ReadAll(rc)
 		if err != nil {
 			return nil, 0, syscall.EIO
 		}
@@ -67,10 +67,7 @@ func (zf *zipFile) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint3
 
 // Read simply returns the data that was already unpacked in the Open call
 func (zf *zipFile) Read(ctx context.Context, f fs.FileHandle, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
-	end := int(off) + len(dest)
-	if end > len(zf.data) {
-		end = len(zf.data)
-	}
+	end := min(int(off)+len(dest), len(zf.data))
 	return fuse.ReadResultData(zf.data[off:end]), fs.OK
 }
 

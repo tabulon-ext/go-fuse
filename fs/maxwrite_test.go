@@ -2,12 +2,14 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+//go:build linux
+
 package fs
 
 import (
 	"context"
 	"fmt"
-	"io/ioutil"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -244,8 +246,8 @@ func bdiReadahead(mnt string) int {
 	if err != nil {
 		panic(err)
 	}
-	path := fmt.Sprintf("/sys/class/bdi/%d:%d/read_ahead_kb", unix.Major(st.Dev), unix.Minor(st.Dev))
-	buf, err := ioutil.ReadFile(path)
+	path := fmt.Sprintf("/sys/class/bdi/%d:%d/read_ahead_kb", unix.Major(uint64(st.Dev)), unix.Minor(uint64(st.Dev)))
+	buf, err := os.ReadFile(path)
 	if err != nil {
 		panic(err)
 	}

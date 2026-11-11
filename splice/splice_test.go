@@ -1,3 +1,5 @@
+//go:build linux
+
 // Copyright 2016 the Go-FUSE Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
@@ -5,7 +7,7 @@
 package splice
 
 import (
-	"io/ioutil"
+	"os"
 	"testing"
 )
 
@@ -19,8 +21,8 @@ func TestPairSize(t *testing.T) {
 		b[i] = byte(i)
 	}
 
-	f, _ := ioutil.TempFile("", "splice")
-	err := ioutil.WriteFile(f.Name(), b, 0644)
+	f, _ := os.CreateTemp("", "splice")
+	err := os.WriteFile(f.Name(), b, 0644)
 	if err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}

@@ -7,31 +7,12 @@ package fs
 import (
 	"context"
 	"syscall"
-	"time"
 
 	"github.com/hanwen/go-fuse/v2/fuse"
+	"golang.org/x/sys/unix"
 )
 
-func (f *loopbackFile) Allocate(ctx context.Context, off uint64, sz uint64, mode uint32) syscall.Errno {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	err := syscall.Fallocate(f.fd, mode, int64(off), int64(sz))
-	if err != nil {
-		return ToErrno(err)
-	}
-	return OK
-}
-
-// Utimens - file handle based version of loopbackFileSystem.Utimens()
-func (f *loopbackFile) utimens(a *time.Time, m *time.Time) syscall.Errno {
-	var ts [2]syscall.Timespec
-	ts[0] = fuse.UtimeToTimespec(a)
-	ts[1] = fuse.UtimeToTimespec(m)
-	err := futimens(int(f.fd), &ts)
-	return ToErrno(err)
-}
-
-func setBlocks(out *fuse.Attr) {
+func setStatxBlocks(out *fuse.Statx) {
 	if out.Blksize > 0 {
 		return
 	}
@@ -39,4 +20,29 @@ func setBlocks(out *fuse.Attr) {
 	out.Blksize = 4096
 	pages := (out.Size + 4095) / 4096
 	out.Blocks = pages * 8
+}
+
+func (f *LoopbackFile) Statx(ctx context.Context, flags uint32, mask uint32, out *fuse.StatxOut) syscall.Errno {
+	return f.withFd(func(fd int) syscall.Errno {
+		st := unix.Statx_t{}
+		err := unix.Statx(fd, "", int(flags), int(mask), &st)
+		if err != nil {
+			return ToErrno(err)
+		}
+		out.FromStatx(&st)
+
+		return OK
+	})
+}
+
+var _ = (FileWritever)((*LoopbackFile)(nil))
+
+func (f *LoopbackFile) Writev(ctx context.Context, data [][]byte, off int64) (uint32, syscall.Errno) {
+	var n int
+	errno := f.withFd(func(fd int) syscall.Errno {
+		var err error
+		n, err = unix.Pwritev(fd, data, off)
+		return ToErrno(err)
+	})
+	return uint32(max(n, 0)), errno
 }

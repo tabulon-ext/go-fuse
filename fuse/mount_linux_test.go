@@ -1,13 +1,15 @@
 package fuse
 
 import (
+	"errors"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"syscall"
 	"testing"
 
+	"github.com/hanwen/go-fuse/v2/internal/testutil"
 	"github.com/moby/sys/mountinfo"
+	"golang.org/x/sys/unix"
 )
 
 // TestMountDevFd tests the special `/dev/fd/N` mountpoint syntax, where a
@@ -16,11 +18,10 @@ import (
 // In this test, we simulate a privileged parent by using the `fusermount` suid
 // helper.
 func TestMountDevFd(t *testing.T) {
-	realMountPoint, err := ioutil.TempDir("", t.Name())
-	if err != nil {
-		t.Fatal(err)
+	if _, err := fusermountBinary(); err != nil {
+		t.Skip(err)
 	}
-	defer syscall.Rmdir(realMountPoint)
+	realMountPoint := t.TempDir()
 
 	// Call the fusermount suid helper to obtain the file descriptor in place
 	// of a privileged parent.
@@ -35,7 +36,7 @@ func TestMountDevFd(t *testing.T) {
 	// See if we can feed fdMountPoint to NewServer
 	fs := NewDefaultRawFileSystem()
 	opts := MountOptions{
-		Debug: true,
+		Debug: testutil.VerboseTest(),
 	}
 	srv, err := NewServer(fs, fdMountPoint, &opts)
 	if err != nil {
@@ -57,12 +58,12 @@ func TestMountDevFd(t *testing.T) {
 		t.Errorf("expected ENOSYS, got %v", err)
 	}
 
-	// Cleanup is somewhat tricky because `srv` does not know about
-	// `realMountPoint`, so `srv.Unmount()` cannot work.
-	//
-	// A normal user has to call `fusermount -u` for themselves to unmount.
-	// But in this test we can monkey-patch `srv.mountPoint`.
-	srv.mountPoint = realMountPoint
+	// `srv` does not know about `realMountPoint`, so tell it.
+	m, err := NewMount(realMountPoint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv.mount = m
 	if err := srv.Unmount(); err != nil {
 		t.Error(err)
 	}
@@ -86,10 +87,7 @@ func TestMountMaxWrite(t *testing.T) {
 	for _, o := range opts {
 		name := fmt.Sprintf("MaxWrite%d", o.MaxWrite)
 		t.Run(name, func(t *testing.T) {
-			mnt, err := ioutil.TempDir("", name)
-			if err != nil {
-				t.Fatal(err)
-			}
+			mnt := t.TempDir()
 			fs := NewDefaultRawFileSystem()
 			srv, err := NewServer(fs, mnt, &o)
 			if err != nil {
@@ -107,10 +105,7 @@ func TestMountMaxWrite(t *testing.T) {
 // The mount options are a comma-separated string like this:
 // rw,nosuid,nodev,relatime,user_id=1026,group_id=1026
 func mountCheckOptions(t *testing.T, opts MountOptions) (info mountinfo.Info) {
-	mnt, err := ioutil.TempDir("", t.Name())
-	if err != nil {
-		t.Fatal(err)
-	}
+	mnt := t.TempDir()
 	fs := NewDefaultRawFileSystem()
 	srv, err := NewServer(fs, mnt, &opts)
 	if err != nil {
@@ -138,7 +133,6 @@ func mountCheckOptions(t *testing.T, opts MountOptions) (info mountinfo.Info) {
 		Source:     orig.Source,
 		FSType:     orig.FSType,
 		VFSOptions: orig.VFSOptions,
-		Optional:   orig.Optional,
 	}
 	// server needs to run for Unmount to work
 	go srv.Serve()
@@ -153,14 +147,23 @@ func mountCheckOptions(t *testing.T, opts MountOptions) (info mountinfo.Info) {
 // same effective mount options in /proc/self/mounts
 func TestDirectMount(t *testing.T) {
 	optsTable := []MountOptions{
-		{Debug: true},
-		{Debug: true, AllowOther: true},
-		{Debug: true, MaxWrite: 9999},
-		{Debug: true, FsName: "aaa"},
-		{Debug: true, Name: "bbb"},
-		{Debug: true, FsName: "ccc", Name: "ddd"},
+		{},
+		{AllowOther: true},
+		{MaxWrite: 9999},
+		{FsName: "aaa"},
+		{Name: "bbb"},
+		{FsName: "ccc", Name: "ddd"},
+		{FsName: "a,b"},
+		{FsName: `a\b`},
+		{FsName: `a\,b`},
+
+		{Options: []string{"exec"}},
+		{Options: []string{"noexec"}},
+		{Options: []string{"exec", "noexec"}},
+		{Options: []string{"noexec", "exec"}},
 	}
 	for _, opts := range optsTable {
+		opts.Debug = testutil.VerboseTest()
 		// Without DirectMount - i.e. using fusermount
 		o1 := mountCheckOptions(t, opts)
 		// With DirectMount
@@ -185,5 +188,108 @@ DirectMountStrict: %#v
 fusermount:        %#v`, o3, o1)
 			}
 		}
+	}
+}
+
+// TestDirectMountDevSuid checks that [no]dev/suid works with DirectMount and DirectMountStrict
+// and show the same effective mount options in /proc/self/mounts
+func TestDirectMountDevSuid(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("this test requires root permissions")
+	}
+
+	optsTable := []MountOptions{
+		{},
+
+		{Options: []string{"dev"}},
+		{Options: []string{"dev", "nodev"}},
+		{Options: []string{"nodev", "dev"}},
+
+		{Options: []string{"suid"}},
+		{Options: []string{"suid", "nosuid"}},
+		{Options: []string{"nosuid", "suid"}},
+
+		{Options: []string{"dev", "suid"}},
+		{Options: []string{"nodev", "nosuid"}},
+	}
+	for _, opts := range optsTable {
+		opts.Debug = testutil.VerboseTest()
+		// Without DirectMount - i.e. using fusermount
+		o1 := mountCheckOptions(t, opts)
+		// With DirectMount
+		opts.DirectMount = true
+		o2 := mountCheckOptions(t, opts)
+		if o2 != o1 {
+			t.Errorf(`DirectMount effective mount options mismatch:
+DirectMount: %#v
+fusermount:  %#v`, o2, o1)
+
+			// When this already fails then DirectMountStrict will fail the same way.
+			// Skip it for less noise in the logs.
+			continue
+		}
+		// With DirectMountStrict
+		opts.DirectMountStrict = true
+		o3 := mountCheckOptions(t, opts)
+		if o3 != o1 {
+			t.Errorf(`DirectMountStrict effective mount options mismatch:
+DirectMountStrict: %#v
+fusermount:        %#v`, o3, o1)
+		}
+	}
+}
+
+// TestEscapedMountOption tests that fusermount doesn't exit when when using commas or backslashs in options.
+// It also tests that commas or backslashs in options are correctly propagated to /proc/mounts.
+func TestEscapedMountOption(t *testing.T) {
+	fsname := `fsname,with\,many,comm\as,and\backsl\\ashs`
+	opts := &MountOptions{
+		FsName: fsname,
+	}
+	mnt := t.TempDir()
+	fs := NewDefaultRawFileSystem()
+	srv, err := NewServer(fs, mnt, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	go srv.Serve()
+	defer srv.Unmount()
+	mounts, err := mountinfo.GetMounts(mountinfo.SingleEntryFilter(mnt))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(mounts) != 1 {
+		t.Fatalf("Could not find mountpoint %q in /proc/self/mountinfo", mnt)
+	}
+	m := *mounts[0]
+	if m.Source != fsname {
+		t.Errorf("mountinfo(%q): got %q want %q", mnt, m.Source, fsname)
+	}
+}
+
+func TestUnmountBusy(t *testing.T) {
+	dir := t.TempDir()
+	srv, err := NewServer(NewDefaultRawFileSystem(), dir, &MountOptions{
+		Debug: testutil.VerboseTest(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	go srv.Serve()
+	if err := srv.WaitMount(); err != nil {
+		t.Fatal(err)
+	}
+
+	fd, err := syscall.Open(dir, unix.O_PATH, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = srv.Unmount()
+	syscall.Close(fd)
+	if !errors.Is(err, syscall.EBUSY) {
+		t.Errorf("Unmount with open fd: got %v, want EBUSY", err)
+	}
+	if err := srv.Unmount(); err != nil {
+		t.Fatalf("Unmount: %v", err)
 	}
 }

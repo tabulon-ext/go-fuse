@@ -6,9 +6,12 @@ package fs_test
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 	"strconv"
+	"strings"
 	"syscall"
 
 	"github.com/hanwen/go-fuse/v2/fs"
@@ -22,13 +25,17 @@ import (
 //	$ ls -F  /tmp/x/6
 //	2  3  4/  5
 //
-// the file system nodes are deduplicated using inode numbers. The
-// number 2 appears in many directories, but it is actually the represented
-// by the same numberNode{} object, with inode number 2.
+// Prime numbers are deduplicated using inode numbers. The number 2
+// appears in many directories, but it is actually represented by the
+// same numberNode{} object, with inode number 2, ie. it is hard-linked:
 //
 //	$ ls -i1  /tmp/x/2  /tmp/x/8/6/4/2
 //	2 /tmp/x/2
 //	2 /tmp/x/8/6/4/2
+//
+// Directories can have only one parent, so composite numbers are not
+// deduplicated: 4 in /tmp/x/6 and 4 in /tmp/x/8 are different
+// directories, with different inode numbers.
 type numberNode struct {
 	// Must embed an Inode for the struct to work as a node.
 	fs.Inode
@@ -45,6 +52,15 @@ func isPrime(n int) bool {
 		}
 	}
 	return true
+}
+
+// numberToIno returns the inode number for n: n itself for primes, so
+// they are hard-linked, and 0 (automatically assigned) for directories.
+func numberToIno(n int) uint64 {
+	if isPrime(n) {
+		return uint64(n)
+	}
+	return 0
 }
 
 func numberToMode(n int) uint32 {
@@ -65,7 +81,7 @@ func (n *numberNode) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) 
 	for i := 2; i < n.num; i++ {
 		d := fuse.DirEntry{
 			Name: strconv.Itoa(i),
-			Ino:  uint64(i),
+			Ino:  numberToIno(i),
 			Mode: numberToMode(i),
 		}
 		r = append(r, d)
@@ -89,10 +105,11 @@ func (n *numberNode) Lookup(ctx context.Context, name string, out *fuse.EntryOut
 
 	stable := fs.StableAttr{
 		Mode: numberToMode(i),
-		// The child inode is identified by its Inode number.
-		// If multiple concurrent lookups try to find the same
-		// inode, they are deduplicated on this key.
-		Ino: uint64(i),
+		// A prime is identified by its Inode number. If
+		// lookups in different directories find the same
+		// prime, they are deduplicated on this key. Composites
+		// get Ino 0, so each lookup creates a new directory.
+		Ino: numberToIno(i),
 	}
 	operations := &numberNode{num: i}
 
@@ -104,26 +121,53 @@ func (n *numberNode) Lookup(ctx context.Context, name string, out *fuse.EntryOut
 	return child, 0
 }
 
-// ExampleDynamic is a whimsical example of a dynamically discovered
+// Example_dynamic is a whimsical example of a dynamically discovered
 // file system.
 func Example_dynamic() {
-	// This is where we'll mount the FS
-	mntDir := "/tmp/x"
-	os.Mkdir(mntDir, 0755)
-	root := &numberNode{num: 10}
-	server, err := fs.Mount(mntDir, root, &fs.Options{
-		MountOptions: fuse.MountOptions{
-			// Set to true to see how the file system works.
-			Debug: true,
-		},
-	})
+	mntDir, err := os.MkdirTemp("", "dynamic")
 	if err != nil {
-		log.Panic(err)
+		log.Fatal(err)
 	}
+	defer os.RemoveAll(mntDir)
 
-	log.Printf("Mounted on %s", mntDir)
-	log.Printf("Unmount by calling 'fusermount -u %s'", mntDir)
+	root := &numberNode{num: 10}
+	opts := &fs.Options{}
+	// Uncomment to see how the file system works.
+	// opts.Debug = true
+	server, err := fs.Mount(mntDir, root, opts)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer server.Unmount()
 
-	// Wait until unmount before exiting
-	server.Wait()
+	entries, err := os.ReadDir(filepath.Join(mntDir, "6"))
+	if err != nil {
+		log.Fatal(err)
+	}
+	var names []string
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() {
+			name += "/"
+		}
+		names = append(names, name)
+	}
+	fmt.Println("6:", strings.Join(names, " "))
+
+	ino := func(name string) uint64 {
+		var st syscall.Stat_t
+		if err := syscall.Stat(filepath.Join(mntDir, name), &st); err != nil {
+			log.Fatal(err)
+		}
+		return uint64(st.Ino)
+	}
+	fmt.Println("inode of 2:", ino("2"))
+	fmt.Println("inode of 8/6/4/2:", ino("8/6/4/2"))
+	fmt.Println("6/4 and 8/4 share an inode:", ino("6/4") == ino("8/4"))
+
+	// Output:
+	// 6: 2 3 4/ 5
+	// inode of 2: 2
+	// inode of 8/6/4/2: 2
+	// 6/4 and 8/4 share an inode: false
 }

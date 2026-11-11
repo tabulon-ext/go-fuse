@@ -8,7 +8,6 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"io/ioutil"
 	"math/rand"
 	"os"
 	"reflect"
@@ -29,9 +28,11 @@ func testMount(t *testing.T, root InodeEmbedder, opts *Options) (string, *fuse.S
 	if opts == nil {
 		opts = &Options{
 			FirstAutomaticIno: 1,
+			ExternalNodeID:    true,
 		}
 	}
 	opts.Debug = testutil.VerboseTest()
+	opts.PanicHandler = testutil.PanicHandler(t, fuse.EIO)
 
 	server, err := Mount(mntDir, root, opts)
 	if err != nil {
@@ -137,8 +138,7 @@ func TestDataFile(t *testing.T) {
 	if err := syscall.Lstat(mntDir+"/file", &st); err != nil {
 		t.Fatalf("Lstat: %v", err)
 	}
-
-	if want := uint32(syscall.S_IFREG | 0464); st.Mode != want {
+	if want := uint(syscall.S_IFREG | 0464); uint(st.Mode) != want {
 		t.Errorf("got mode %o, want %o", st.Mode, want)
 	}
 
@@ -167,13 +167,13 @@ func TestDataFile(t *testing.T) {
 	}
 
 	replace := []byte("replaced!")
-	if err := ioutil.WriteFile(mntDir+"/file", replace, 0644); err != nil {
+	if err := os.WriteFile(mntDir+"/file", replace, 0644); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
 
-	if gotBytes, err := ioutil.ReadFile(mntDir + "/file"); err != nil {
+	if gotBytes, err := os.ReadFile(mntDir + "/file"); err != nil {
 		t.Fatalf("ReadFile: %v", err)
-	} else if bytes.Compare(replace, gotBytes) != 0 {
+	} else if !bytes.Equal(replace, gotBytes) {
 		t.Fatalf("read: got %q want %q", gotBytes, replace)
 	}
 }
@@ -199,13 +199,61 @@ func TestDataFileLargeRead(t *testing.T) {
 			n.AddChild("file", ch, false)
 		},
 	})
-	got, err := ioutil.ReadFile(mntDir + "/file")
+	got, err := os.ReadFile(mntDir + "/file")
 	if err != nil {
 		t.Fatalf("ReadFile: %v", err)
 	}
 
 	if !bytes.Equal(got, data) {
 		t.Errorf("roundtrip read had change")
+	}
+}
+
+func TestMemFileExtendingTruncate(t *testing.T) {
+	// len < cap, with stale bytes beyond len.
+	backing := []byte("hello, stale bytes")
+	data := backing[:5]
+
+	root := &Inode{}
+	mntDir, _ := testMount(t, root, &Options{
+		FirstAutomaticIno: 1,
+		OnAdd: func(ctx context.Context) {
+			n := root.EmbeddedInode()
+			ch := n.NewPersistentInode(
+				ctx,
+				&MemRegularFile{
+					Data: data,
+					Attr: fuse.Attr{
+						Mode: 0644,
+					},
+				},
+				StableAttr{})
+			n.AddChild("file", ch, false)
+		},
+	})
+
+	fn := mntDir + "/file"
+	for _, sz := range []int{10, 2 * len(backing)} {
+		if err := os.Truncate(fn, int64(sz)); err != nil {
+			t.Fatalf("Truncate(%d): %v", sz, err)
+		}
+		got, err := os.ReadFile(fn)
+		if err != nil {
+			t.Fatalf("ReadFile: %v", err)
+		}
+		want := append([]byte("hello"), make([]byte, sz-5)...)
+		if !bytes.Equal(got, want) {
+			t.Errorf("truncate to %d: got %q, want %q", sz, got, want)
+		}
+	}
+
+	if err := os.Truncate(fn, 3); err != nil {
+		t.Fatalf("Truncate(3): %v", err)
+	}
+	if got, err := os.ReadFile(fn); err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	} else if want := "hel"; string(got) != want {
+		t.Errorf("truncate to 3: got %q, want %q", got, want)
 	}
 }
 
@@ -238,9 +286,23 @@ func TestDataSymlink(t *testing.T) {
 	}
 }
 
+func readDirStream(st DirStream) (result []fuse.DirEntry, errno syscall.Errno) {
+	for st.HasNext() {
+		var de fuse.DirEntry
+		de, errno = st.Next()
+		if errno != 0 {
+			return
+		}
+
+		result = append(result, de)
+	}
+	return
+}
+
 func TestReaddirplusParallel(t *testing.T) {
 	root := &Inode{}
 	N := 100
+	P := 100
 	oneSec := time.Second
 	names := map[string]int64{}
 	mntDir, _ := testMount(t, root, &Options{
@@ -265,40 +327,163 @@ func TestReaddirplusParallel(t *testing.T) {
 		},
 	})
 
-	read := func() (map[string]int64, error) {
-		es, err := os.ReadDir(mntDir)
-		if err != nil {
-			return nil, err
+	read := func() ([]fuse.DirEntry, error) {
+		ds, errno := NewLoopbackDirStream(mntDir)
+		if errno != 0 {
+			return nil, errno
 		}
-
-		r := map[string]int64{}
-		for _, e := range es {
-			inf, err := e.Info()
-			if err != nil {
-				return nil, err
-			}
-			r[e.Name()] = inf.Size()
+		defer ds.Close()
+		es, errno := readDirStream(ds)
+		if errno != 0 {
+			return nil, errno
 		}
-		return r, nil
+		return es, nil
 	}
 
+	want, err := read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(want) != N {
+		t.Fatalf("read back %d entries, want %d", len(want), N)
+	}
 	var wg sync.WaitGroup
-	for i := 0; i < N; i++ {
+	for i := 0; i < P; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			res, err := read()
+			got, err := read()
 			if err != nil {
 				t.Errorf("readdir: %v", err)
-			}
-			if got, want := len(res), len(names); got != want {
-				t.Errorf("got %d want %d", got, want)
 				return
 			}
-			if !reflect.DeepEqual(res, names) {
-				t.Errorf("maps have different content")
+			if len(got) != len(want) {
+				t.Errorf("got len %d, want %d", len(got), len(want))
+				return
+			}
+			for i := 0; i < len(got) && i < len(want); i++ {
+				if !reflect.DeepEqual(got[i], want[i]) {
+					t.Errorf("entry %d: got %v, want %v", i, got[i], want[i])
+					return
+				}
 			}
 		}()
 	}
 	wg.Wait()
+}
+
+func TestReaddirplusConsistency(t *testing.T) {
+	root := &Inode{}
+	N := 100
+	oneSec := time.Second
+	mnt, _ := testMount(t, root, &Options{
+		FirstAutomaticIno: 1,
+		EntryTimeout:      &oneSec,
+		AttrTimeout:       &oneSec,
+		OnAdd: func(ctx context.Context) {
+			n := root.EmbeddedInode()
+
+			for i := 0; i < N; i++ {
+				ch := n.NewPersistentInode(
+					ctx,
+					&MemRegularFile{
+						Data: bytes.Repeat([]byte{'x'}, i),
+					},
+					StableAttr{})
+
+				name := fmt.Sprintf("file%04d", i)
+				n.AddChild(name, ch, false)
+			}
+		},
+	})
+
+	posixtest.ReadDirConsistency(t, mnt)
+}
+
+type memDir struct {
+	Inode
+}
+
+func (md *memDir) Create(ctx context.Context, name string, flags uint32, mode uint32, out *fuse.EntryOut) (node *Inode, fh FileHandle, fuseFlags uint32, errno syscall.Errno) {
+	mrf := MemRegularFile{}
+	ch := md.NewInode(ctx, &mrf, StableAttr{Mode: fuse.S_IFREG})
+	md.AddChild(name, ch, true)
+
+	return ch, nil, 0, 0
+}
+
+func TestMemPosix(t *testing.T) {
+	for _, nm := range []string{
+		"AppendWrite",
+		"DirectIO",
+		"Fallocate",
+		"FallocateKeepSize",
+		"FcntlFlockSetLk",
+		"FdLeak",
+		"FstatDeleted",
+		"LseekEnxioCheck",
+		"LseekHoleSeeksToEOF",
+		"ParallelFileOpen",
+		"ReadDirBasic",
+		"ReadDirConsistency",
+		"TruncateFile",
+		"TruncateNoFile",
+	} {
+		fn := posixtest.All[nm]
+		t.Run(nm, func(t *testing.T) {
+			if fn == nil {
+				t.Skipf("posixtest %q not available on this platform", nm)
+			}
+			root := &memDir{}
+			mnt := t.TempDir()
+
+			opts := Options{}
+			opts.Debug = testutil.VerboseTest()
+			ttl := 100 * time.Second
+			opts.EntryTimeout = &ttl
+			opts.AttrTimeout = &ttl
+			srv, err := Mount(mnt, root, &opts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				srv.Unmount()
+			})
+			srv.WaitMount()
+			fn(t, mnt)
+		})
+	}
+}
+
+func TestInodeParentsHardlink(t *testing.T) {
+	root := &Inode{}
+	file := &MemRegularFile{Data: []byte("hello")}
+	var fileInode *Inode
+	mntDir, _ := testMount(t, root, &Options{
+		OnAdd: func(ctx context.Context) {
+			fileInode = root.NewPersistentInode(ctx, file, StableAttr{Mode: syscall.S_IFREG})
+			root.AddChild("a", fileInode, false)
+			dir := root.NewPersistentInode(ctx, &Inode{}, StableAttr{Mode: syscall.S_IFDIR})
+			root.AddChild("dir", dir, false)
+			dir.AddChild("b", fileInode, false)
+		},
+	})
+
+	got := map[string]bool{}
+	for _, p := range fileInode.Parents() {
+		got[p.Name] = true
+	}
+	if len(got) != 2 || !got["a"] || !got["b"] {
+		t.Errorf("Parents: got %v, want a and b", got)
+	}
+
+	for _, fn := range []string{"a", "dir/b"} {
+		var st syscall.Stat_t
+		if err := syscall.Stat(mntDir+"/"+fn, &st); err != nil {
+			t.Fatal(err)
+		}
+		if st.Nlink != 2 {
+			t.Errorf("%s: got Nlink %d, want 2", fn, st.Nlink)
+		}
+	}
 }

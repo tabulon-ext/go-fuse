@@ -12,97 +12,40 @@ import (
 	"sync/atomic"
 	"syscall"
 	"testing"
-	"unsafe"
+	"time"
 
 	"github.com/hanwen/go-fuse/v2/fuse"
 )
 
-// TestBridgeReaddirPlusVirtualEntries looks at "." and ".." in the ReadDirPlus
-// output. They should exist, but the NodeId should be zero.
-func TestBridgeReaddirPlusVirtualEntries(t *testing.T) {
-	// Set suppressDebug as we do our own logging
-	tc := newTestCase(t, &testOptions{suppressDebug: true})
-
-	rb := tc.rawFS.(*rawBridge)
-
-	// We only populate what rawBridge.OpenDir() actually looks at.
-	openIn := fuse.OpenIn{}
-	openIn.NodeId = 1 // root node always has id 1 and always exists
-	openOut := fuse.OpenOut{}
-	status := rb.OpenDir(nil, &openIn, &openOut)
-	if !status.Ok() {
-		t.Fatal(status)
-	}
-	releaseIn := fuse.ReleaseIn{
-		Fh: openOut.Fh,
-	}
-	releaseIn.NodeId = 1
-	defer rb.ReleaseDir(&releaseIn)
-
-	// We only populate what rawBridge.ReadDirPlus() actually looks at.
-	readIn := fuse.ReadIn{}
-	readIn.NodeId = 1
-	readIn.Fh = openOut.Fh
-	buf := make([]byte, 400)
-	dirents := fuse.NewDirEntryList(buf, 0)
-	status = rb.ReadDirPlus(nil, &readIn, dirents)
-	if !status.Ok() {
-		t.Fatal(status)
-	}
-
-	// Parse the output buffer. Looks like this in memory:
-	// 1) fuse.EntryOut
-	// 2) fuse._Dirent
-	// 3) Name (null-terminated)
-	// 4) Padding to align to 8 bytes
-	// [repeat]
-	const entryOutSize = int(unsafe.Sizeof(fuse.EntryOut{}))
-	// = unsafe.Sizeof(fuse._Dirent{}), see fuse/types.go
-	const direntSize = 24
-	// Round up to 8.
-	const entry2off = (entryOutSize + direntSize + len(".\x00") + 7) / 8 * 8
-
-	names := map[string]*fuse.EntryOut{}
-	// 1st entry should be "."
-	entry1 := (*fuse.EntryOut)(unsafe.Pointer(&buf[0]))
-	name1 := string(buf[entryOutSize+direntSize : entryOutSize+direntSize+2])
-	names[name1] = entry1
-
-	// 2nd entry should be ".."
-	entry2 := (*fuse.EntryOut)(unsafe.Pointer(&buf[entry2off]))
-	name2 := string(buf[entry2off+entryOutSize+direntSize : entry2off+entryOutSize+direntSize+2])
-
-	names[name2] = entry2
-
-	if len(names) != 2 || names[".\000"] == nil || names[".."] == nil {
-		t.Fatalf(`got %v, want {".\\0", ".."}`, names)
-	}
-
-	for k, v := range names {
-		if v.NodeId != 0 {
-			t.Errorf("entry %q NodeId should be 0, but is %d", k, v.NodeId)
-		}
-	}
-}
-
 // TestTypeChange simulates inode number reuse that happens on real
 // filesystems. For go-fuse, inode number reuse can look like a file changing
-// to a directory or vice versa. Acutally, the old inode does not exist anymore,
+// to a directory or vice versa. Actually, the old inode does not exist anymore,
 // we just have not received the FORGET yet.
 func TestTypeChange(t *testing.T) {
 	rootNode := testTypeChangeIno{}
-	mnt, _ := testMount(t, &rootNode, nil)
+	opts := Options{
+		ExternalNodeID: true,
+	}
+	mnt, _ := testMount(t, &rootNode, &opts)
 
 	for i := 0; i < 100; i++ {
-		fi, _ := os.Stat(mnt + "/file")
+		fi, err := os.Stat(mnt + "/file")
+		if err != nil {
+			t.Fatalf("Stat(file): %v", err)
+		}
+
 		syscall.Unlink(mnt + "/file")
-		fi, _ = os.Stat(mnt + "/dir")
+		fi, err = os.Stat(mnt + "/dir")
+		if err != nil {
+			t.Fatalf("Stat(dir): %v", err)
+		}
 		if !fi.IsDir() {
 			t.Fatal("should be a dir now")
 		}
 		syscall.Rmdir(mnt + "/dir")
-		fi, _ = os.Stat(mnt + "/file")
-		if fi.IsDir() {
+		if fi, err := os.Stat(mnt + "/file"); err != nil {
+			t.Fatalf("Stat after rmdir: %v", err)
+		} else if fi.IsDir() {
 			t.Fatal("should be a file now")
 		}
 	}
@@ -184,11 +127,18 @@ func (n *testDeletedIno) Lookup(ctx context.Context, name string, out *fuse.Entr
 	return child, syscall.F_OK
 }
 
-func (n *testDeletedIno) Opendir(ctx context.Context) syscall.Errno {
-	return OK
+var _ NodeOpendirHandler = (*testDeletedIno)(nil)
+
+func (n *testDeletedIno) OpendirHandle(ctx context.Context, flags uint32) (fh FileHandle, fuseFlags uint32, errno syscall.Errno) {
+	return &struct{}{}, 0, OK
 }
 
 func (n *testDeletedIno) Getattr(ctx context.Context, f FileHandle, out *fuse.AttrOut) syscall.Errno {
+	root := n.Root().Operations().(*testDeletedIno)
+	if n.IsRoot() || atomic.LoadInt32(&root.deleted) == 0 {
+		out.Mode = syscall.S_IFDIR | 0755
+		return OK
+	}
 	prefix := ".go-fuse"
 	p := n.Path(n.Root())
 	if strings.HasPrefix(p, prefix) {
@@ -206,7 +156,10 @@ func (n *testDeletedIno) Getattr(ctx context.Context, f FileHandle, out *fuse.At
 //	panic: using reserved ID 1 for inode number
 func TestIno1(t *testing.T) {
 	rootNode := testIno1{}
-	mnt, _ := testMount(t, &rootNode, nil)
+	opts := &Options{
+		FirstAutomaticIno: 1,
+	}
+	mnt, _ := testMount(t, &rootNode, opts)
 
 	var st syscall.Stat_t
 	err := syscall.Stat(mnt+"/ino1", &st)
@@ -232,4 +185,45 @@ func (fn *testIno1) Lookup(ctx context.Context, name string, out *fuse.EntryOut)
 	}
 	child := fn.NewInode(ctx, &testIno1{}, stable)
 	return child, 0
+}
+
+type lookupCountRoot struct {
+	Inode
+	count uint32
+}
+
+func (r *lookupCountRoot) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*Inode, syscall.Errno) {
+	if name == "TestNegativeLookupCache" {
+		atomic.AddUint32(&r.count, 1)
+	}
+	return nil, syscall.ENOENT
+}
+
+func TestNegativeLookupCache(t *testing.T) {
+	for count, negCache := range []bool{true, false} {
+		r := lookupCountRoot{}
+		opt := &Options{}
+		if negCache {
+			sec := time.Second
+			opt.NegativeTimeout = &sec
+		}
+
+		mnt, _ := testMount(t, &r, opt)
+		fn := mnt + "/TestNegativeLookupCache"
+		for i := 0; i < 2; i++ {
+			var st syscall.Stat_t
+			if err := syscall.Lstat(fn, &st); err != syscall.ENOENT {
+				t.Errorf("got %v, want ENOENT", err)
+			}
+		}
+		want := uint32(count + 1)
+		if got := atomic.LoadUint32(&r.count); got != want {
+			t.Errorf("negCache=%v: got count %d, want %d", negCache, got, want)
+		}
+	}
+}
+
+// NewNodeFS should not crash with opts=nil
+func TestNewNodeFSNilOpts(t *testing.T) {
+	NewNodeFS(&Inode{}, nil)
 }

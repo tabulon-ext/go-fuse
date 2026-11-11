@@ -11,26 +11,45 @@ jobs:
     strategy:
       matrix:
         go:
-          - "1.13.x" # Ubuntu 20.04 LTS "focal"
-          - "1.15.x" # Debian 11 "Bullseye"
-          - "1.16.x" # Golang upstream stable
-          - "1.17.x" # Golang upstream stable
+          - "1.21.x" # Golang upstream stable
+          - "1.22.x" # Golang upstream stable
+          - "1.23.x" # Golang upstream stable
+          - "1.24.x" # Golang upstream stable
+          - "1.25.x" # Golang upstream stable
+          - "1.26.x" # Golang upstream stable
+        GOMAXPROCS:
+          - ""  # Use all cpus (default).
+          - "1" # Single-cpu mode. Some failures are only visible like this.
       # Don't cancel everything when one Go version fails
       fail-fast: false
     runs-on: ubuntu-latest
     steps:
 
     - name: Install Go ${{ matrix.go }}
-      uses: actions/setup-go@v2
+      uses: actions/setup-go@v5
       with:
         go-version: ${{ matrix.go }}
 
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v4
       with:
         fetch-depth: 0 # Make "git describe" work
 
     # CI platform specific setup steps happen here
-    - run: sudo apt-get install -qq fuse3 libssl-dev libfuse-dev
+    - run: sudo apt-get install -qq fuse3 libssl-dev libfuse-dev 
+    - run: echo user_allow_other | sudo tee -a /etc/fuse.conf
+    # Ubuntu 25.10+ confines fusermount3 with an AppArmor profile that
+    # only allows a subset of mount options and mountpoints, so
+    # fusermount3 fails with "mount failed: Permission denied".
+    - name: Unconfine fusermount3
+      run: |
+        if [ -e /etc/apparmor.d/fusermount3 ]; then
+          sudo apparmor_parser -R /etc/apparmor.d/fusermount3
+          sudo ln -sf /etc/apparmor.d/fusermount3 /etc/apparmor.d/disable/
+        fi
 
     # Actual test steps are in all.bash
-    - run: ./all.bash
+    - run: GOMAXPROCS="${{ matrix.GOMAXPROCS }}" ./all.bash
+
+    - name: Show AppArmor denials
+      if: failure()
+      run: sudo dmesg | grep -i 'apparmor="DENIED"' | tail -50 || true

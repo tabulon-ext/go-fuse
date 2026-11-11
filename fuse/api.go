@@ -93,7 +93,8 @@
 // setuid-root helper to call `mount(2)` for us. This is the default.
 // Does not need root permissions but needs `fusermount` installed.
 //
-// 2) If `MountOptions.DirectMount` is set, go-fuse calls `mount(2)` itself.
+// 2) If `MountOptions.DirectMount` is set, or if `fusermount` is not
+// installed, go-fuse calls `mount(2)` itself.
 // Needs root permissions, but works without `fusermount`.
 //
 // 3) If `mountPoint` has the magic `/dev/fd/N` syntax, it means that that a
@@ -120,7 +121,22 @@
 // [1] https://github.com/libfuse/libfuse/commit/64e11073b9347fcf9c6d1eea143763ba9e946f70
 //
 // [2] https://sylabs.io/guides/3.7/user-guide/bind_paths_and_mounts.html#fuse-mounts
+//
+// # Aborting a file system
+//
+// A caller that has an open file in a buggy or crashed FUSE
+// filesystem will be hung. The easiest way to clean up this situation
+// is through the fusectl filesystem. By writing into
+// /sys/fs/fuse/connection/$ID/abort, reads from the FUSE device fail,
+// and all callers receive ENOTCONN (transport endpoint not connected)
+// on their pending syscalls.  The FUSE connection ID can be found as
+// the Dev field in the Stat_t result for a file in the mount.
 package fuse
+
+import (
+	"context"
+	"log"
+)
 
 // Types for users to implement.
 
@@ -145,16 +161,39 @@ type ReadResult interface {
 type MountOptions struct {
 	AllowOther bool
 
-	// Options are passed as -o string to fusermount.
+	// Options are the options passed as -o string to fusermount.
 	Options []string
 
-	// Default is _DEFAULT_BACKGROUND_TASKS, 12.  This numbers
-	// controls the allowed number of requests that relate to
-	// async I/O.  Concurrency for synchronous I/O is not limited.
+	// MaxBackground controls the maximum number of allowed backgruond
+	// asynchronous I/O requests.
+	//
+	// If unset, the default is _DEFAULT_BACKGROUND_TASKS, 12.
+	// Concurrency for synchronous I/O is not limited.
 	MaxBackground int
 
+	// MaxInflightRequestBytes controls the number of bytes used for
+	// request structs and input buffers checked out by go-fuse. This
+	// includes buffers used by readers waiting on the kernel and requests
+	// being processed concurrently.
+	//
+	// It also applies to requests that do not expect a reply, such as
+	// FORGET and BATCH_FORGET. If unset, it defaults to math.MaxInt. If
+	// set smaller than the bytes needed for a single request, one request
+	// is still allowed through.
+	MaxInflightRequestBytes int
+
+	// CongestionThreshold is the in-flight async-request count at which
+	// the kernel marks the FUSE backing-dev as congested, throttling new
+	// submissions. It corresponds to
+	// /sys/fs/fuse/connections/<id>/congestion_threshold.
+	//
+	// If 0, go-fuse falls back to the kernel-FUSE convention of
+	// 3/4 * MaxBackground. The value is silently clamped by the kernel
+	// to MaxBackground if it is set higher.
+	CongestionThreshold int
+
 	// MaxWrite is the max size for read and write requests. If 0, use
-	// go-fuse default (currently 64 kiB).
+	// go-fuse default (currently 128 kiB).
 	// This number is internally capped at MAX_KERNEL_WRITE (higher values don't make
 	// sense).
 	//
@@ -191,72 +230,110 @@ type MountOptions struct {
 	// (up to MaxWrite or VM_READAHEAD_PAGES=128 kiB, whichever is less).
 	MaxReadAhead int
 
-	// If IgnoreSecurityLabels is set, all security related xattr
-	// requests will return NO_DATA without passing through the
-	// user defined filesystem.  You should only set this if you
+	// IgnoreSecurityLabels, if set, makes security related xattr
+	// requests return NO_DATA without passing through the
+	// user defined filesystem. You should only set this if you
 	// file system implements extended attributes, and you are not
 	// interested in security labels.
 	IgnoreSecurityLabels bool // ignoring labels should be provided as a fusermount mount option.
 
-	// If RememberInodes is set, we will never forget inodes.
+	// RememberInodes, if set, makes go-fuse never forget inodes.
 	// This may be useful for NFS.
 	RememberInodes bool
 
-	// Values shown in "df -T" and friends
-	// First column, "Filesystem"
+	// FsName is the name of the filesystem, shown in "df -T"
+	// and friends (as the first column, "Filesystem").
 	FsName string
 
-	// Second column, "Type", will be shown as "fuse." + Name
+	// Name is the "fuse.<name>" suffix, shown in "df -T" and friends
+	// (as the second column, "Type")
 	Name string
 
-	// If set, wrap the file system in a single-threaded locking wrapper.
+	// SingleThreaded, if set, wraps the file system in a single-threaded
+	// locking wrapper.
 	SingleThreaded bool
 
-	// If set, return ENOSYS for Getxattr calls, so the kernel does not issue any
-	// Xattr operations at all.
+	// DisableXAttrs, if set, returns ENOSYS for Getxattr, Setxattr and
+	// Removexattr calls, so the kernel does not issue any Xattr operations
+	// at all.
 	DisableXAttrs bool
 
-	// If set, print debugging information.
+	// Debug, if set, enables verbose debugging information.
 	Debug bool
 
-	// If set, ask kernel to forward file locks to FUSE. If using,
-	// you must implement the GetLk/SetLk/SetLkw methods.
+	// Logger, if set, is an alternate log sink for debug statements.
+	//
+	// To increase signal/noise ratio Go-FUSE uses abbreviations in its debug log
+	// output. Here is how to read it:
+	//
+	// - `iX` means `inode X`;
+	// - `gX` means `generation X`;
+	// - `tA` and `tE` means timeout for attributes and directory entry correspondingly;
+	// - `[<off> +<size>)` means data range from `<off>` inclusive till `<off>+<size>` exclusive;
+	// - `Xb` means `X bytes`.
+	// - `pX` means the request originated from PID `x`. 0 means the request originated from the kernel.
+	//
+	// Every line is prefixed with either `rx <unique>` (receive from kernel) or `tx <unique>` (send to kernel)
+	//
+	// Example debug log output:
+	//
+	//     rx 2: LOOKUP i1 [".wcfs"] 6b p5874
+	//     tx 2:     OK, {i3 g2 tE=1s tA=1s {M040755 SZ=0 L=0 1000:1000 B0*0 i0:3 A 0.000000 M 0.000000 C 0.000000}}
+	//     rx 3: LOOKUP i3 ["zurl"] 5b p5874
+	//     tx 3:     OK, {i4 g3 tE=1s tA=1s {M0100644 SZ=33 L=1 1000:1000 B0*0 i0:4 A 0.000000 M 0.000000 C 0.000000}}
+	//     rx 4: OPEN i4 {O_RDONLY,0x8000} p5874
+	//     tx 4:     38=function not implemented, {Fh 0 }
+	//     rx 5: READ i4 {Fh 0 [0 +4096)  L 0 RDONLY,0x8000} p5874
+	//     tx 5:     OK,  33b data "file:///"...
+	//     rx 6: GETATTR i4 {Fh 0} p5874
+	//     tx 6:     OK, {tA=1s {M0100644 SZ=33 L=1 1000:1000 B0*0 i0:4 A 0.000000 M 0.000000 C 0.000000}}
+	//     rx 7: FLUSH i4 {Fh 0} p5874
+	//     tx 7:     OK
+	//     rx 8: LOOKUP i1 ["head"] 5b p5874
+	//     tx 8:     OK, {i5 g4 tE=1s tA=1s {M040755 SZ=0 L=0 1000:1000 B0*0 i0:5 A 0.000000 M 0.000000 C 0.000000}}
+	//     rx 9: LOOKUP i5 ["bigfile"] 8b p5874
+	//     tx 9:     OK, {i6 g5 tE=1s tA=1s {M040755 SZ=0 L=0 1000:1000 B0*0 i0:6 A 0.000000 M 0.000000 C 0.000000}}
+	//     rx 10: FLUSH i4 {Fh 0} p5874
+	//     tx 10:     OK
+	//     rx 11: GETATTR i1 {Fh 0} p5874
+	//     tx 11:     OK, {tA=1s {M040755 SZ=0 L=1 1000:1000 B0*0 i0:1 A 0.000000 M 0.000000 C 0.000000}}
+	Logger *log.Logger
+
+	// EnableLocks, if set, asks the kernel to forward file locks to FUSE
+	// When used, you must implement the GetLk/SetLk/SetLkw methods.
 	EnableLocks bool
 
-	// If set, the kernel caches all Readlink return values. The
-	// filesystem must use content notification to force the
+	// EnableSymlinkCaching, if set, makes the kernel cache all Readlink return values.
+	// The filesystem must use content notification to force the
 	// kernel to issue a new Readlink call.
 	EnableSymlinkCaching bool
 
-	// If set, ask kernel not to do automatic data cache invalidation.
-	// The filesystem is fully responsible for invalidating data cache.
+	// ExplicitDataCacheControl, if set, asks the kernel not to do automatic
+	// data cache invalidation. The filesystem is fully responsible for
+	// invalidating data cache.
 	ExplicitDataCacheControl bool
 
-	// SyncRead is off by default, which means that go-fuse enable the
-	// FUSE_CAP_ASYNC_READ capability.
-	// The kernel then submits multiple concurrent reads to service
-	// userspace requests and kernel readahead.
-	//
-	// Setting SyncRead disables the FUSE_CAP_ASYNC_READ capability.
-	// The kernel then only sends one read request per file handle at a time,
-	// and orders the requests by offset.
-	//
-	// This is useful if reading out of order or concurrently is expensive for
+	// SyncRead disables the CAP_ASYNC_READ capability.  The
+	// kernel then only sends one read request per file handle at
+	// a time, and orders the requests by offset.  This is useful
+	// if reading out of order or concurrently is expensive for
 	// (example: Amazon Cloud Drive).
+	//
+	// If unset, multiple concurrent reads may be issued to
+	// service userspace requests and kernel readahead.
 	//
 	// See the comment to FUSE_CAP_ASYNC_READ in
 	// https://github.com/libfuse/libfuse/blob/master/include/fuse_common.h
 	// for more details.
 	SyncRead bool
 
-	// If set, fuse will first attempt to use syscall.Mount instead of
+	// DirectMount, if set, makes go-fuse first attempt to use syscall.Mount instead of
 	// fusermount to mount the filesystem. This will not update /etc/mtab
 	// but might be needed if fusermount is not available.
-	// Also, Server.Unmount will attempt syscall.Unmount before calling
-	// fusermount.
+	// Unmounting does not depend on it; see Mount.Unmount.
 	DirectMount bool
 
-	// DirectMountStrict is like DirectMount but no fallback to fusermount is
+	// DirectMountStrict, if set, is like DirectMount but no fallback to fusermount is
 	// performed. If both DirectMount and DirectMountStrict are set,
 	// DirectMountStrict wins.
 	DirectMountStrict bool
@@ -268,25 +345,100 @@ type MountOptions struct {
 	// by the kernel. See `man 2 mount` for details about MS_MGC_VAL.
 	DirectMountFlags uintptr
 
-	// EnableAcls enables kernel ACL support.
+	// EnableAcl, if set, enables kernel ACL support.
 	//
 	// See the comments to FUSE_CAP_POSIX_ACL
 	// in https://github.com/libfuse/libfuse/blob/master/include/fuse_common.h
 	// for details.
 	EnableAcl bool
 
-	// Disable ReadDirPlus capability so ReadDir is used instead. Simple
-	// directory queries (i.e. 'ls' without '-l') can be faster with
-	// ReadDir, as no per-file stat calls are needed
+	// DisableReadDirPlus, if set, disables the ReadDirPlus capability so
+	// ReadDir is used instead. Simple directory queries (i.e. 'ls' without
+	// '-l') can be faster with ReadDir, as no per-file stat calls are needed.
 	DisableReadDirPlus bool
+
+	// DisableSplice, if set, disables splicing from files to the FUSE device.
+	DisableSplice bool
+
+	// PanicHandler is called if an FS routine panics. The handler
+	// should return a nonzero status. If not set, the default is
+	// to print a stack trace and return EIO.
+	PanicHandler func(any) Status
+
+	// InitHandler, if set, is called with the reply to the
+	// kernel's INIT request after RawFileSystem.Init, and may
+	// modify it. See RawFileSystem.Init for the limits.
+	InitHandler func(in *InitIn, out *InitOut)
+
+	// MaxStackDepth is the maximum stacking depth for passthrough files.
+	// If unset, the default is 1.
+	MaxStackDepth int
+
+	// IDMappedMount, if set, enables an ID-mapped mount if the Kernel supports
+	// it.
+	//
+	// An ID-mapped mount allows the device to be mounted on the system with the
+	// IDs remapped (via mount_setattr, move_mount syscalls) to those of the
+	// user on the local system.
+	//
+	// Enabling this flag automatically sets the "default_permissions" mount
+	// option. This is required by FUSE to delegate the UID/GID-based permission
+	// checks to the kernel. For requests that create new inodes, FUSE will send
+	// the mapped UID/GIDs. For all other requests, FUSE will send "-1".
+	IDMappedMount bool
+
+	// DisabledCapabilities is a bitmask, containing capablities
+	// (the CAP_* bitmasks) that must be disabled for the entire
+	// mount.
+	DisabledCapabilities uint64
+
+	// ExtraCapabilities is a bitmask of capabilities which
+	// must be enabled in addition to the defaults.
+	ExtraCapabilities uint64
+}
+
+// Conn is the connection with the kernel, as negotiated by the INIT
+// request (struct fuse_conn in the kernel). It is passed to
+// RawFileSystem.OnConnect, and the file system may keep it for later
+// use.
+type Conn struct {
+	in      InitIn
+	out     InitOut
+	notify  *Notify
+	backing *Backing
+}
+
+// In returns the INIT request from the kernel.
+func (c *Conn) In() InitIn {
+	return c.in
+}
+
+// Out returns the reply to INIT, as sent to the kernel.
+func (c *Conn) Out() InitOut {
+	return c.out
+}
+
+// Notify returns the notifications to the kernel. OnConnect may replace
+// its functions, eg. to wrap them for metrics or testing; the Server
+// methods (EntryNotify, etc.) dispatch through the same struct. It
+// can be used once OnConnect has returned, but not from within OnConnect.
+func (c *Conn) Notify() *Notify {
+	return c.notify
+}
+
+// Backing returns the calls for managing backing files. OnConnect may
+// replace its functions, like for Notify.
+func (c *Conn) Backing() *Backing {
+	return c.backing
 }
 
 // RawFileSystem is an interface close to the FUSE wire protocol.
 //
 // Unless you really know what you are doing, you should not implement
-// this, but rather the nodefs.Node or pathfs.FileSystem interfaces; the
-// details of getting interactions with open files, renames, and threading
-// right etc. are somewhat tricky and not very interesting.
+// this, but rather the interfaces associated with
+// fs.InodeEmbedder. The details of getting interactions with open
+// files, renames, and threading right etc. are somewhat tricky and
+// not very interesting.
 //
 // Each FUSE request results in a corresponding method called by Server.
 // Several calls may be made simultaneously, because the server typically calls
@@ -299,97 +451,116 @@ type MountOptions struct {
 // following requests, and reading/writing the request data will lead
 // to race conditions.  If you spawn a background routine from a FUSE
 // API call, any incoming request data it wants to reference should be
-// copied over.
+// copied over. The `ctx` argument may be retained.
 //
-// If a FUSE API call is canceled (which is signaled by closing the
-// `cancel` channel), the API call should return EINTR. In this case,
-// the outstanding request data is not reused, so the API call may
-// return EINTR without ensuring that child contexts have successfully
-// completed.
+// If a FS operation is interrupted, `ctx` is canceled. The fileystem
+// can honor this request by returning EINTR. Interrupts occur if the
+// process accessing the file system receives any signal that is not
+// ignored. In particular, the Go runtime uses signals to manage
+// goroutine preemption, so Go programs under load naturally
+// generate interupt opcodes when they access a FUSE filesystem.
 type RawFileSystem interface {
 	String() string
-
-	// If called, provide debug output through the log package.
-	SetDebug(debug bool)
 
 	// Lookup is called by the kernel when the VFS wants to know
 	// about a file inside a directory. Many lookup calls can
 	// occur in parallel, but only one call happens for each (dir,
 	// name) pair.
-	Lookup(cancel <-chan struct{}, header *InHeader, name string, out *EntryOut) (status Status)
+	Lookup(ctx context.Context, header *InHeader, name string, out *EntryOut) (status Status)
 
 	// Forget is called when the kernel discards entries from its
-	// dentry cache. This happens on unmount, and when the kernel
-	// is short on memory. Since it is not guaranteed to occur at
-	// any moment, and since there is no return value, Forget
-	// should not do I/O, as there is no channel to report back
-	// I/O errors.
+	// dentry cache. This happens on unmount, deletion, and when
+	// the kernel is short on memory. Since it is not guaranteed
+	// to occur at any moment, and since there is no return value,
+	// Forget should not do I/O, as there is no channel to report
+	// back I/O errors.
 	Forget(nodeid, nlookup uint64)
 
 	// Attributes.
-	GetAttr(cancel <-chan struct{}, input *GetAttrIn, out *AttrOut) (code Status)
-	SetAttr(cancel <-chan struct{}, input *SetAttrIn, out *AttrOut) (code Status)
+	GetAttr(ctx context.Context, input *GetAttrIn, out *AttrOut) (code Status)
+	SetAttr(ctx context.Context, input *SetAttrIn, out *AttrOut) (code Status)
 
 	// Modifying structure.
-	Mknod(cancel <-chan struct{}, input *MknodIn, name string, out *EntryOut) (code Status)
-	Mkdir(cancel <-chan struct{}, input *MkdirIn, name string, out *EntryOut) (code Status)
-	Unlink(cancel <-chan struct{}, header *InHeader, name string) (code Status)
-	Rmdir(cancel <-chan struct{}, header *InHeader, name string) (code Status)
-	Rename(cancel <-chan struct{}, input *RenameIn, oldName string, newName string) (code Status)
-	Link(cancel <-chan struct{}, input *LinkIn, filename string, out *EntryOut) (code Status)
+	Mknod(ctx context.Context, input *MknodIn, name string, out *EntryOut) (code Status)
+	Mkdir(ctx context.Context, input *MkdirIn, name string, out *EntryOut) (code Status)
+	Unlink(ctx context.Context, header *InHeader, name string) (code Status)
+	Rmdir(ctx context.Context, header *InHeader, name string) (code Status)
+	Rename(ctx context.Context, input *RenameIn, oldName string, newName string) (code Status)
+	Link(ctx context.Context, input *LinkIn, filename string, out *EntryOut) (code Status)
 
-	Symlink(cancel <-chan struct{}, header *InHeader, pointedTo string, linkName string, out *EntryOut) (code Status)
-	Readlink(cancel <-chan struct{}, header *InHeader) (out []byte, code Status)
-	Access(cancel <-chan struct{}, input *AccessIn) (code Status)
+	Symlink(ctx context.Context, header *InHeader, pointedTo string, linkName string, out *EntryOut) (code Status)
+	Readlink(ctx context.Context, header *InHeader) (out []byte, code Status)
+	Access(ctx context.Context, input *AccessIn) (code Status)
 
 	// Extended attributes.
 
 	// GetXAttr reads an extended attribute, and should return the
 	// number of bytes. If the buffer is too small, return ERANGE,
 	// with the required buffer size.
-	GetXAttr(cancel <-chan struct{}, header *InHeader, attr string, dest []byte) (sz uint32, code Status)
+	GetXAttr(ctx context.Context, header *InHeader, attr string, dest []byte) (sz uint32, code Status)
 
 	// ListXAttr lists extended attributes as '\0' delimited byte
 	// slice, and return the number of bytes. If the buffer is too
 	// small, return ERANGE, with the required buffer size.
-	ListXAttr(cancel <-chan struct{}, header *InHeader, dest []byte) (uint32, Status)
+	ListXAttr(ctx context.Context, header *InHeader, dest []byte) (uint32, Status)
 
 	// SetAttr writes an extended attribute.
-	SetXAttr(cancel <-chan struct{}, input *SetXAttrIn, attr string, data []byte) Status
+	SetXAttr(ctx context.Context, input *SetXAttrIn, attr string, data []byte) Status
 
 	// RemoveXAttr removes an extended attribute.
-	RemoveXAttr(cancel <-chan struct{}, header *InHeader, attr string) (code Status)
+	RemoveXAttr(ctx context.Context, header *InHeader, attr string) (code Status)
 
 	// File handling.
-	Create(cancel <-chan struct{}, input *CreateIn, name string, out *CreateOut) (code Status)
-	Open(cancel <-chan struct{}, input *OpenIn, out *OpenOut) (status Status)
-	Read(cancel <-chan struct{}, input *ReadIn, buf []byte) (ReadResult, Status)
-	Lseek(cancel <-chan struct{}, in *LseekIn, out *LseekOut) Status
+	Create(ctx context.Context, input *CreateIn, name string, out *CreateOut) (code Status)
+	Tmpfile(ctx context.Context, input *CreateIn, out *CreateOut) (code Status)
+	Open(ctx context.Context, input *OpenIn, out *OpenOut) (status Status)
+	Read(ctx context.Context, input *ReadIn, buf []byte) (ReadResult, Status)
+	Lseek(ctx context.Context, in *LseekIn, out *LseekOut) Status
 
 	// File locking
-	GetLk(cancel <-chan struct{}, input *LkIn, out *LkOut) (code Status)
-	SetLk(cancel <-chan struct{}, input *LkIn) (code Status)
-	SetLkw(cancel <-chan struct{}, input *LkIn) (code Status)
+	GetLk(ctx context.Context, input *LkIn, out *LkOut) (code Status)
+	SetLk(ctx context.Context, input *LkIn) (code Status)
+	SetLkw(ctx context.Context, input *LkIn) (code Status)
 
-	Release(cancel <-chan struct{}, input *ReleaseIn)
-	Write(cancel <-chan struct{}, input *WriteIn, data []byte) (written uint32, code Status)
-	CopyFileRange(cancel <-chan struct{}, input *CopyFileRangeIn) (written uint32, code Status)
+	// Release and ReleaseDir drop a file handle returned by a successful
+	// Open/Create or OpenDir. The kernel ignores the result and sends no
+	// credentials, so the Caller in ctx is zero, and ctx is normally only
+	// canceled when the connection goes away.
+	Release(ctx context.Context, input *ReleaseIn)
+	Write(ctx context.Context, input *WriteIn, data []byte) (written uint32, code Status)
 
-	Flush(cancel <-chan struct{}, input *FlushIn) Status
-	Fsync(cancel <-chan struct{}, input *FsyncIn) (code Status)
-	Fallocate(cancel <-chan struct{}, input *FallocateIn) (code Status)
+	// Writev is called for WRITE. On ENOSYS fallback to Write
+	Writev(ctx context.Context, input *WriteIn, data [][]byte) (written uint32, code Status)
+	CopyFileRange(ctx context.Context, input *CopyFileRangeIn) (written uint32, code Status)
+	Ioctl(ctx context.Context, input *IoctlIn, inbuf []byte, output *IoctlOut, outbuf []byte) (code Status)
+
+	Flush(ctx context.Context, input *FlushIn) Status
+	Fsync(ctx context.Context, input *FsyncIn) (code Status)
+	Fallocate(ctx context.Context, input *FallocateIn) (code Status)
 
 	// Directory handling
-	OpenDir(cancel <-chan struct{}, input *OpenIn, out *OpenOut) (status Status)
-	ReadDir(cancel <-chan struct{}, input *ReadIn, out *DirEntryList) Status
-	ReadDirPlus(cancel <-chan struct{}, input *ReadIn, out *DirEntryList) Status
-	ReleaseDir(input *ReleaseIn)
-	FsyncDir(cancel <-chan struct{}, input *FsyncIn) (code Status)
+	OpenDir(ctx context.Context, input *OpenIn, out *OpenOut) (status Status)
+	ReadDir(ctx context.Context, input *ReadIn, out *DirEntryList) Status
+	ReadDirPlus(ctx context.Context, input *ReadIn, out *DirEntryList) Status
+	ReleaseDir(ctx context.Context, input *ReleaseIn)
+	FsyncDir(ctx context.Context, input *FsyncIn) (code Status)
 
-	StatFs(cancel <-chan struct{}, input *InHeader, out *StatfsOut) (code Status)
+	StatFs(ctx context.Context, input *InHeader, out *StatfsOut) (code Status)
 
-	// This is called on processing the first request. The
-	// filesystem implementation can use the server argument to
-	// talk back to the kernel (through notify methods).
-	Init(*Server)
+	Statx(ctx context.Context, input *StatxIn, out *StatxOut) (code Status)
+	// Init is called with the kernel's INIT request and the
+	// proposed reply, and may modify the reply before it is sent.
+	// Major and Minor cannot be changed, flags are limited to
+	// those the kernel offered, and MaxWrite and MaxPages can
+	// only be lowered. It is only called when a new connection
+	// is negotiated.
+	Init(in *InitIn, out *InitOut)
+
+	// OnConnect is called when the connection with the kernel has
+	// been negotiated, after Init and MountOptions.InitHandler,
+	// and before any request other than INIT is served. See Conn.
+	OnConnect(*Conn)
+
+	// Called after processing the last request.
+	OnUnmount()
 }

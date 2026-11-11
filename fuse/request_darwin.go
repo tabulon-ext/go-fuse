@@ -4,10 +4,14 @@
 
 package fuse
 
-const outputHeaderSize = 200
+const outputDataSize = 184
+
+// inputDataSize fits SetAttrIn, which has OS X specific fields
+// (bkuptime, chgtime, crtime, flags).
+const inputDataSize = 168
 
 const (
 	_FUSE_KERNEL_VERSION   = 7
 	_MINIMUM_MINOR_VERSION = 12
-	_OUR_MINOR_VERSION     = 12
+	_OUR_MINOR_VERSION     = 19
 )

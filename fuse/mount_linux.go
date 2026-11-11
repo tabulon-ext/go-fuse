@@ -7,13 +7,12 @@ package fuse
 import (
 	"bytes"
 	"fmt"
-	"log"
 	"os"
 	"os/exec"
 	"path"
+	"strconv"
 	"strings"
 	"syscall"
-	"unsafe"
 )
 
 func unixgramSocketpair() (l, r *os.File, err error) {
@@ -30,11 +29,6 @@ func unixgramSocketpair() (l, r *os.File, err error) {
 // Create a FUSE FS on the specified mount point without using
 // fusermount.
 func mountDirect(mountPoint string, opts *MountOptions, ready chan<- error) (fd int, err error) {
-	fd, err = syscall.Open("/dev/fuse", os.O_RDWR, 0) // use syscall.Open since we want an int fd
-	if err != nil {
-		return
-	}
-
 	// managed to open dev/fuse, attempt to mount
 	source := opts.FsName
 	if source == "" {
@@ -52,8 +46,20 @@ func mountDirect(mountPoint string, opts *MountOptions, ready chan<- error) (fd 
 		return
 	}
 
+	fd, err = syscall.Open("/dev/fuse", os.O_RDWR, 0) // use syscall.Open since we want an int fd
+	if err != nil {
+		return
+	}
+
 	// some values we need to pass to mount - we do as fusermount does.
 	// override possible since opts.Options comes after.
+	//
+	// Only the options listed below are understood by the kernel:
+	// https://elixir.bootlin.com/linux/v6.14.2/source/fs/fuse/inode.c#L772
+	// https://elixir.bootlin.com/linux/v6.14.2/source/fs/fs_context.c#L41
+	// https://elixir.bootlin.com/linux/v6.14.2/source/fs/fs_context.c#L50
+	// Everything else will cause an EINVAL error from syscall.Mount() and
+	// a corresponding error message in the kernel logs.
 	var r = []string{
 		fmt.Sprintf("fd=%d", fd),
 		fmt.Sprintf("rootmode=%o", st.Mode&syscall.S_IFMT),
@@ -62,14 +68,37 @@ func mountDirect(mountPoint string, opts *MountOptions, ready chan<- error) (fd 
 		// match what we do with fusermount
 		fmt.Sprintf("max_read=%d", opts.MaxWrite),
 	}
-	r = append(r, opts.Options...)
+
+	// In syscall.Mount(), [no]dev/suid/exec must be
+	// passed as bits in the flags parameter, not as strings.
+	for _, o := range opts.Options {
+		switch o {
+		case "nodev":
+			flags |= syscall.MS_NODEV
+		case "dev":
+			flags &^= syscall.MS_NODEV
+		case "nosuid":
+			flags |= syscall.MS_NOSUID
+		case "suid":
+			flags &^= syscall.MS_NOSUID
+		case "noexec":
+			flags |= syscall.MS_NOEXEC
+		case "exec":
+			flags &^= syscall.MS_NOEXEC
+		default:
+			r = append(r, o)
+		}
+	}
 
 	if opts.AllowOther {
 		r = append(r, "allow_other")
 	}
+	if opts.IDMappedMount && !opts.containsOption("default_permissions") {
+		r = append(r, "default_permissions")
+	}
 
 	if opts.Debug {
-		log.Printf("mountDirect: calling syscall.Mount(%q, %q, %q, %#x, %q)",
+		opts.Logger.Printf("mountDirect: calling syscall.Mount(%q, %q, %q, %#x, %q)",
 			source, mountPoint, "fuse."+opts.Name, flags, strings.Join(r, ","))
 	}
 	err = syscall.Mount(source, mountPoint, "fuse."+opts.Name, flags, strings.Join(r, ","))
@@ -108,12 +137,12 @@ func callFusermount(mountPoint string, opts *MountOptions) (fd int, err error) {
 		cmd = append(cmd, "-o", strings.Join(s, ","))
 	}
 	if opts.Debug {
-		log.Printf("callFusermount: executing %q", cmd)
+		opts.Logger.Printf("callFusermount: executing %q", cmd)
 	}
 	proc, err := os.StartProcess(bin,
 		cmd,
 		&os.ProcAttr{
-			Env:   []string{"_FUSE_COMMFD=3"},
+			Env:   helperEnv("_FUSE_COMMFD=3"),
 			Files: []*os.File{os.Stdin, os.Stdout, os.Stderr, remote}})
 
 	if err != nil {
@@ -145,7 +174,7 @@ func mount(mountPoint string, opts *MountOptions, ready chan<- error) (fd int, e
 		if err == nil {
 			return fd, nil
 		} else if opts.Debug {
-			log.Printf("mount: failed to do direct mount: %s", err)
+			opts.Logger.Printf("mount: failed to do direct mount: %s", err)
 		}
 		if opts.DirectMountStrict {
 			return -1, err
@@ -157,8 +186,14 @@ func mount(mountPoint string, opts *MountOptions, ready chan<- error) (fd int, e
 	fd = parseFuseFd(mountPoint)
 	if fd >= 0 {
 		if opts.Debug {
-			log.Printf("mount: magic mountpoint %q, using fd %d", mountPoint, fd)
+			opts.Logger.Printf("mount: magic mountpoint %q, using fd %d", mountPoint, fd)
 		}
+	} else if _, lookErr := fusermountBinary(); lookErr != nil {
+		fd, err = mountDirect(mountPoint, opts, ready)
+		if err != nil {
+			return -1, fmt.Errorf("%v; direct mount: %w", lookErr, err)
+		}
+		return fd, nil
 	} else {
 		// Usual case: mount via the `fusermount` suid helper
 		fd, err = callFusermount(mountPoint, opts)
@@ -174,61 +209,29 @@ func mount(mountPoint string, opts *MountOptions, ready chan<- error) (fd int, e
 	return fd, err
 }
 
-func unmount(mountPoint string, opts *MountOptions) (err error) {
-	if opts.DirectMount || opts.DirectMountStrict {
-		// Attempt to directly unmount, if fails fallback to fusermount method
-		err := syscall.Unmount(mountPoint, 0)
-		if err == nil {
-			return nil
-		}
-		if opts.DirectMountStrict {
-			return err
-		}
-	}
-
-	bin, err := fusermountBinary()
-	if err != nil {
+func unmount(mountPoint string) error {
+	err := syscall.Unmount(mountPoint, 0)
+	if err != syscall.EPERM {
 		return err
+	}
+	bin, ferr := fusermountBinary()
+	if ferr != nil {
+		return fmt.Errorf("%w; %v", err, ferr)
 	}
 	errBuf := bytes.Buffer{}
 	cmd := exec.Command(bin, "-u", mountPoint)
 	cmd.Stderr = &errBuf
-	if opts.Debug {
-		log.Printf("unmount: executing %q", cmd.Args)
-	}
+	cmd.Env = helperEnv()
 	err = cmd.Run()
 	if errBuf.Len() > 0 {
-		return fmt.Errorf("%s (code %v)\n",
-			errBuf.String(), err)
+		msg := strings.TrimSpace(errBuf.String())
+		// fusermount reports errno only through strerror(3).
+		if strings.Contains(msg, "Device or resource busy") {
+			return fmt.Errorf("%s: %w", msg, syscall.EBUSY)
+		}
+		return fmt.Errorf("%s (code %v)", msg, err)
 	}
 	return err
-}
-
-func getConnection(local *os.File) (int, error) {
-	var data [4]byte
-	control := make([]byte, 4*256)
-
-	// n, oobn, recvflags, from, errno  - todo: error checking.
-	_, oobn, _, _,
-		err := syscall.Recvmsg(
-		int(local.Fd()), data[:], control[:], 0)
-	if err != nil {
-		return 0, err
-	}
-
-	message := *(*syscall.Cmsghdr)(unsafe.Pointer(&control[0]))
-	fd := *(*int32)(unsafe.Pointer(uintptr(unsafe.Pointer(&control[0])) + syscall.SizeofCmsghdr))
-
-	if message.Type != 1 {
-		return 0, fmt.Errorf("getConnection: recvmsg returned wrong control type: %d", message.Type)
-	}
-	if oobn <= syscall.SizeofCmsghdr {
-		return 0, fmt.Errorf("getConnection: too short control message. Length: %d", oobn)
-	}
-	if fd < 0 {
-		return 0, fmt.Errorf("getConnection: fd < 0: %d", fd)
-	}
-	return int(fd), nil
 }
 
 // lookPathFallback - search binary in PATH and, if that fails,
@@ -254,4 +257,24 @@ func fusermountBinary() (string, error) {
 
 func umountBinary() (string, error) {
 	return lookPathFallback("umount", "/bin")
+}
+
+func getMaxWrite() int {
+	return maxPageLimit() * syscall.Getpagesize()
+}
+
+func maxPageLimit() (lim int) {
+	lim = 256
+
+	d, err := os.ReadFile("/proc/sys/fs/fuse/max_pages_limit")
+	if err != nil {
+		return lim
+	}
+
+	newLim, err := strconv.Atoi(strings.TrimSpace(string(d)))
+	if err != nil {
+		return lim
+	}
+
+	return newLim
 }

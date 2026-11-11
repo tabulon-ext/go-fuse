@@ -7,7 +7,7 @@ package fs
 import (
 	"context"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"log"
 	"os"
 	"os/exec"
@@ -25,6 +25,7 @@ import (
 	"github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/hanwen/go-fuse/v2/internal/testutil"
 	"github.com/hanwen/go-fuse/v2/posixtest"
+	"golang.org/x/sys/unix"
 )
 
 type testCase struct {
@@ -41,7 +42,7 @@ type testCase struct {
 
 // writeOrig writes a file into the backing directory of the loopback mount
 func (tc *testCase) writeOrig(path, content string, mode os.FileMode) {
-	if err := ioutil.WriteFile(filepath.Join(tc.origDir, path), []byte(content), mode); err != nil {
+	if err := os.WriteFile(filepath.Join(tc.origDir, path), []byte(content), mode); err != nil {
 		tc.Fatal(err)
 	}
 }
@@ -61,6 +62,8 @@ type testOptions struct {
 	ro                bool
 	directMount       bool // sets MountOptions.DirectMount
 	directMountStrict bool // sets MountOptions.DirectMountStrict
+	disableSplice     bool // sets MountOptions.DisableSplice
+	idMappedMount     bool // sets MountOptions.IDMappedMount
 }
 
 // newTestCase creates the directories `orig` and `mnt` inside a temporary
@@ -101,22 +104,34 @@ func newTestCase(t *testing.T, opts *testOptions) *testCase {
 	if !opts.entryCache {
 		entryDT = nil
 	}
-	tc.rawFS = NewNodeFS(tc.loopback, &Options{
-		EntryTimeout: entryDT,
-		AttrTimeout:  attrDT,
-		Logger:       log.New(os.Stderr, "", 0),
-	})
+	fsOpts := &Options{
+		EntryTimeout:   entryDT,
+		AttrTimeout:    attrDT,
+		Logger:         log.New(os.Stderr, "", 0),
+		ExternalNodeID: true,
+	}
+	if opts.suppressDebug {
+		fsOpts.Logger = log.New(io.Discard, "", 0)
+	}
+	tc.rawFS = NewNodeFS(tc.loopback, fsOpts)
 
 	mOpts := &fuse.MountOptions{
 		DirectMount:       opts.directMount,
 		DirectMountStrict: opts.directMountStrict,
 		EnableLocks:       opts.enableLocks,
+		DisableSplice:     opts.disableSplice,
+		IDMappedMount:     opts.idMappedMount,
+		Logger:            fsOpts.Logger,
+		PanicHandler:      testutil.PanicHandler(t, fuse.EIO),
 	}
 	if !opts.suppressDebug {
 		mOpts.Debug = testutil.VerboseTest()
 	}
 	if opts.ro {
 		mOpts.Options = append(mOpts.Options, "ro")
+	}
+	if opts.idMappedMount {
+		mOpts.Options = append(mOpts.Options, "default_permissions")
 	}
 	tc.server, err = fuse.NewServer(tc.rawFS, tc.mntDir, mOpts)
 	if err != nil {
@@ -161,9 +176,18 @@ func TestBasic(t *testing.T) {
 	}
 }
 
+func TestExec(t *testing.T) {
+	tc := newTestCase(t, &testOptions{attrCache: true, entryCache: true})
+	tc.writeOrig("test.sh", "#!/bin/sh\ntrue\n", 0755)
+	fn := tc.mntDir + "/test.sh"
+	if err := exec.Command("/bin/sh", "-c", fn).Run(); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+}
+
 func TestFileFdLeak(t *testing.T) {
 	tc := newTestCase(t, &testOptions{
-		suppressDebug: true,
+		suppressDebug: false,
 		attrCache:     true,
 		entryCache:    true,
 	})
@@ -174,8 +198,13 @@ func TestFileFdLeak(t *testing.T) {
 	bridge := tc.rawFS.(*rawBridge)
 	tc = nil
 
-	if got := len(bridge.files); got > 3 {
-		t.Errorf("found %d used file handles, should be <= 3", got)
+	bridge.ids.mu.Lock()
+	got := len(bridge.ids.files)
+	bridge.ids.mu.Unlock()
+
+	// posixtest.FdLeak also uses 15 as a limit.
+	if want := 15; got > want {
+		t.Errorf("found %d used file handles, should be <= %d", got, want)
 	}
 }
 
@@ -211,13 +240,164 @@ func TestNotifyEntry(t *testing.T) {
 	}
 }
 
+type forgetNode struct {
+	Inode
+	forgetCalled uint32
+}
+
+func (n *forgetNode) OnForget() {
+	atomic.AddUint32(&n.forgetCalled, 1)
+}
+
+func TestNotifyPrune(t *testing.T) {
+	mnt := t.TempDir()
+	root := &Inode{}
+	forgetter := &forgetNode{}
+	opts := &Options{
+		ExternalNodeID: true,
+		OnAdd: func(ctx context.Context) {
+			child := root.NewInode(ctx, forgetter, StableAttr{})
+			root.AddChild("file", child, true)
+		},
+	}
+
+	opts.Debug = testutil.VerboseTest()
+	srv, err := Mount(mnt, root, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Unmount()
+
+	st := syscall.Stat_t{}
+	fn := filepath.Join(mnt, "file")
+	if err := syscall.Lstat(fn, &st); err != nil {
+		t.Fatalf("Lstat before: %v", err)
+	}
+
+	if errno := root.NotifyPrune([]*Inode{forgetter.EmbeddedInode()}); errno == syscall.ENOSYS {
+		t.Skip("notify not supported")
+	} else if errno != 0 {
+		t.Errorf("notify failed: %v", errno)
+	}
+	time.Sleep(10 * time.Millisecond)
+	if err := srv.Unmount(); err != nil {
+		t.Fatal(err)
+	}
+	if forgetter.forgetCalled != 1 {
+		t.Errorf("forgetCalled=%d", forgetter.forgetCalled)
+	}
+}
+
+type notifyWrapFS struct {
+	fuse.RawFileSystem
+	init func(*fuse.InitIn, *fuse.InitOut)
+	wrap func(*fuse.Conn)
+}
+
+func (fs *notifyWrapFS) Init(in *fuse.InitIn, out *fuse.InitOut) {
+	fs.init(in, out)
+	fs.RawFileSystem.Init(in, out)
+}
+
+func (fs *notifyWrapFS) OnConnect(c *fuse.Conn) {
+	fs.wrap(c)
+	fs.RawFileSystem.OnConnect(c)
+}
+
+func TestWrapNotify(t *testing.T) {
+	mnt := t.TempDir()
+	root := &Inode{}
+	var entryNotifies, inodeNotifies int32
+	var conn *fuse.Conn
+	sec := time.Second
+	opts := &Options{
+		EntryTimeout: &sec,
+		OnAdd: func(ctx context.Context) {
+			ch := root.NewPersistentInode(ctx, &Inode{}, StableAttr{})
+			root.AddChild("file", ch, true)
+		},
+	}
+	opts.Debug = testutil.VerboseTest()
+	var handlerMaxWrite uint32
+	opts.InitHandler = func(in *fuse.InitIn, out *fuse.InitOut) {
+		handlerMaxWrite = out.MaxWrite
+		out.MaxBackground = 7
+	}
+	rawFS := &notifyWrapFS{
+		RawFileSystem: NewNodeFS(root, opts),
+		init: func(in *fuse.InitIn, out *fuse.InitOut) {
+			out.MaxWrite = 8192
+		},
+		wrap: func(c *fuse.Conn) {
+			conn = c
+			n := c.Notify()
+			entry := n.InvalEntry
+			n.InvalEntry = func(parent uint64, name string) fuse.Status {
+				atomic.AddInt32(&entryNotifies, 1)
+				return entry(parent, name)
+			}
+			inode := n.InvalInode
+			n.InvalInode = func(node uint64, off, length int64) fuse.Status {
+				atomic.AddInt32(&inodeNotifies, 1)
+				return inode(node, off, length)
+			}
+			n.Delete = func(uint64, uint64, string) fuse.Status { return fuse.ENOSYS }
+		},
+	}
+	srv, err := fuse.NewServer(rawFS, mnt, &opts.MountOptions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	go srv.Serve()
+	if err := srv.WaitMount(); err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Unmount()
+
+	if handlerMaxWrite != 8192 {
+		t.Errorf("InitHandler saw MaxWrite %d, want 8192 set by Init", handlerMaxWrite)
+	}
+	if out := conn.Out(); out.MaxWrite != 8192 || out.MaxBackground != 7 {
+		t.Errorf("Conn.Out() = %v, want MaxWrite 8192, MaxBackground 7", out)
+	}
+
+	fn := filepath.Join(mnt, "file")
+	var st syscall.Stat_t
+	if err := syscall.Lstat(fn, &st); err != nil {
+		t.Fatalf("Lstat before: %v", err)
+	}
+
+	ch := root.GetChild("file")
+	root.RmChild("file")
+	if errno := root.NotifyEntry("file"); errno != 0 {
+		t.Fatalf("NotifyEntry: %v", errno)
+	}
+	if got := atomic.LoadInt32(&entryNotifies); got != 1 {
+		t.Errorf("entryNotifies=%d, want 1", got)
+	}
+	if err := syscall.Lstat(fn, &st); err != syscall.ENOENT {
+		t.Errorf("Lstat after: got %v, want ENOENT", err)
+	}
+
+	if errno := root.NotifyDelete("file", ch); errno != syscall.ENOSYS {
+		t.Errorf("NotifyDelete: got %v, want ENOSYS", errno)
+	}
+
+	if st := srv.InodeNotify(fuse.FUSE_ROOT_ID, 0, 0); !st.Ok() {
+		t.Errorf("InodeNotify: %v", st)
+	}
+	if got := atomic.LoadInt32(&inodeNotifies); got != 1 {
+		t.Errorf("inodeNotifies=%d, want 1", got)
+	}
+}
+
 func TestReadDirStress(t *testing.T) {
 	tc := newTestCase(t, &testOptions{suppressDebug: true, attrCache: true, entryCache: true})
 
 	// Create 110 entries
 	for i := 0; i < 110; i++ {
 		name := fmt.Sprintf("file%036x", i)
-		if err := ioutil.WriteFile(filepath.Join(tc.mntDir, name), []byte("hello"), 0644); err != nil {
+		if err := os.WriteFile(filepath.Join(tc.mntDir, name), []byte("hello"), 0644); err != nil {
 			t.Fatalf("WriteFile %q: %v", name, err)
 		}
 	}
@@ -232,12 +412,11 @@ func TestReadDirStress(t *testing.T) {
 				return
 			}
 			_, err = f.Readdirnames(-1)
+			f.Close()
 			if err != nil {
 				t.Errorf("goroutine %d iteration %d: %v", gr, i, err)
-				f.Close()
 				return
 			}
-			f.Close()
 		}
 	}
 
@@ -247,30 +426,38 @@ func TestReadDirStress(t *testing.T) {
 		go stress(i)
 	}
 	wg.Wait()
+
 }
 
-// This test is racy. If an external process consumes space while this
-// runs, we may see spurious differences between the two statfs() calls.
 func TestStatFs(t *testing.T) {
 	tc := newTestCase(t, &testOptions{attrCache: true, entryCache: true})
-
-	empty := syscall.Statfs_t{}
-	orig := empty
-	if err := syscall.Statfs(tc.origDir, &orig); err != nil {
-		t.Fatal("statfs orig", err)
+	var before, after, mnt syscall.Statfs_t
+	if err := syscall.Statfs(tc.origDir, &before); err != nil {
+		t.Fatal("statfs before", err)
 	}
 
-	mnt := syscall.Statfs_t{}
 	if err := syscall.Statfs(tc.mntDir, &mnt); err != nil {
 		t.Fatal("statfs mnt", err)
 	}
 
-	var mntFuse, origFuse fuse.StatfsOut
-	mntFuse.FromStatfsT(&mnt)
-	origFuse.FromStatfsT(&orig)
+	if err := syscall.Statfs(tc.origDir, &after); err != nil {
+		t.Fatal("statfs after", err)
+	}
 
-	if !reflect.DeepEqual(mntFuse, origFuse) {
-		t.Errorf("Got %#v, want %#v", mntFuse, origFuse)
+	var beforeFuse, afterFuse, mntFuse fuse.StatfsOut
+	mntFuse.FromStatfsT(&mnt)
+	beforeFuse.FromStatfsT(&before)
+	afterFuse.FromStatfsT(&after)
+
+	if !reflect.DeepEqual(beforeFuse, afterFuse) {
+		// This test is racy. If an external process consumes
+		// space while this runs, we may see spurious
+		// differences between the two statfs() calls.
+		t.Skipf("FS changed during test run, %v != %v", beforeFuse, afterFuse)
+	}
+
+	if !reflect.DeepEqual(mntFuse, beforeFuse) {
+		t.Errorf("Got %#v, want %#v", mntFuse, beforeFuse)
 	}
 }
 
@@ -318,44 +505,12 @@ func TestGetAttrParallel(t *testing.T) {
 	wg.Wait()
 }
 
-func TestMknod(t *testing.T) {
-	tc := newTestCase(t, &testOptions{})
-
-	modes := map[string]uint32{
-		"regular": syscall.S_IFREG,
-		"socket":  syscall.S_IFSOCK,
-		"fifo":    syscall.S_IFIFO,
-	}
-
-	for nm, mode := range modes {
-		t.Run(nm, func(t *testing.T) {
-			p := filepath.Join(tc.mntDir, nm)
-			err := syscall.Mknod(p, mode|0755, (8<<8)|0)
-			if err != nil {
-				t.Fatalf("mknod(%s): %v", nm, err)
-			}
-
-			var st syscall.Stat_t
-			if err := syscall.Stat(p, &st); err != nil {
-				got := st.Mode &^ 07777
-				if want := mode; got != want {
-					t.Fatalf("stat(%s): got %o want %o", nm, got, want)
-				}
-			}
-
-			// We could test if the files can be
-			// read/written but: The kernel handles FIFOs
-			// without talking to FUSE at all. Presumably,
-			// this also holds for sockets.  Regular files
-			// are tested extensively elsewhere.
-		})
-	}
-}
-
 func TestMknodNotSupported(t *testing.T) {
 	mountPoint := t.TempDir()
 
-	server, err := Mount(mountPoint, &Inode{}, nil)
+	opts := Options{}
+	opts.MountOptions.Debug = testutil.VerboseTest()
+	server, err := Mount(mountPoint, &Inode{}, &opts)
 	if err != nil {
 		t.Fatalf("cannot mount: %v", err)
 	}
@@ -364,7 +519,7 @@ func TestMknodNotSupported(t *testing.T) {
 
 	name := filepath.Join(mountPoint, "foo")
 
-	if got, want := syscall.Mknod(name, syscall.S_IFREG|0755, (8<<8)|0), syscall.ENOTSUP; got != want {
+	if got, want := syscall.Mknod(name, syscall.S_IFIFO|0755, 0), syscall.ENOTSUP; got != want {
 		t.Fatalf("mknod: got %v, want %v", got, want)
 	}
 }
@@ -373,10 +528,14 @@ func TestPosix(t *testing.T) {
 	noisy := map[string]bool{
 		"ParallelFileOpen": true,
 		"ReadDir":          true,
+		"OpenSymlinkRace":  true,
 	}
 
 	for nm, fn := range posixtest.All {
 		t.Run(nm, func(t *testing.T) {
+			if nm == "NlinkZero" && runtime.GOOS == "freebsd" {
+				t.Skip("FreeBSD keeps cached attributes of a file replaced by rename")
+			}
 			tc := newTestCase(t, &testOptions{
 				suppressDebug: noisy[nm],
 				attrCache:     true,
@@ -389,14 +548,22 @@ func TestPosix(t *testing.T) {
 	}
 }
 
+func TestReadDisableSplice(t *testing.T) {
+	tc := newTestCase(t, &testOptions{
+		disableSplice: true,
+	})
+
+	posixtest.FileBasic(t, tc.mntDir)
+}
+
 func TestOpenDirectIO(t *testing.T) {
 	// Apparently, tmpfs does not allow O_DIRECT, so try to create
 	// a test temp directory in /var/tmp.
-	ext4Dir, err := ioutil.TempDir("/var/tmp", "go-fuse.TestOpenDirectIO")
+	ext4Dir, err := os.MkdirTemp("/var/tmp", "go-fuse.TestOpenDirectIO")
 	if err != nil {
 		t.Fatalf("MkdirAll: %v", err)
 	}
-	defer os.RemoveAll(ext4Dir)
+	t.Cleanup(func() { os.RemoveAll(ext4Dir) })
 
 	posixtest.DirectIO(t, ext4Dir)
 	if t.Failed() {
@@ -580,17 +747,24 @@ func TestFsstress(t *testing.T) {
 		log.Panicf("shell injection attempt? mntDir=%q", tc.mntDir)
 	}
 	// --color=always enables xattr lookups for extra stress
-	cmd := exec.Command("bash", "-c", "while true ; do ls -l --color=always '"+tc.mntDir+"'; done")
+	cmd := exec.Command("/bin/sh", "-c", "while true ; do ls -l --color=always '"+tc.mntDir+"'; done")
 	err := cmd.Start()
 	if err != nil {
 		t.Fatal(err)
 	}
+	wg.Add(1)
+	go func() {
+		cmd.Wait()
+		wg.Done()
+	}()
+
 	defer cmd.Process.Kill()
 
 	// Run the test for 1 second. If it deadlocks, it usually does within 20ms.
 	time.Sleep(1 * time.Second)
 
 	cancel()
+	cmd.Process.Kill()
 
 	// waitTimeout waits for the waitgroup for the specified max timeout.
 	// Returns true if waiting timed out.
@@ -638,28 +812,38 @@ func TestStaleHardlinks(t *testing.T) {
 	// Disable all caches we can disable
 	tc := newTestCase(t, &testOptions{attrCache: false, entryCache: false})
 
+	// gvfsd-trash sets an inotify watch on mntDir and stat()s every file that is
+	// created, racing with the test logic ( https://github.com/hanwen/go-fuse/issues/478 ).
+	// Use a subdir to prevent that.
+	if err := os.Mkdir(tc.mntDir+"/x", 0755); err != nil {
+		t.Fatal(err)
+	}
+
 	// "link0" is original file
-	link0 := tc.mntDir + "/link0"
-	if fd, err := syscall.Creat(link0, 0600); err != nil {
+	link0 := tc.mntDir + "/x/link0"
+	if fd, err := unix.Open(link0, unix.O_CREAT, 0600); err != nil {
 		t.Fatal(err)
 	} else {
 		syscall.Close(fd)
 	}
 	// Create hardlinks via mntDir
+	t.Logf("create link1...20, pid=%d", os.Getpid())
 	for i := 1; i < 20; i++ {
-		linki := fmt.Sprintf(tc.mntDir+"/link%d", i)
+		linki := fmt.Sprintf(tc.mntDir+"/x/link%d", i)
 		if err := syscall.Link(link0, linki); err != nil {
 			t.Fatal(err)
 		}
 	}
 	// Delete hardlinks via origDir (behind loopback fs's back)
+	t.Log("delete link1...20 behind loopback's back")
 	for i := 1; i < 20; i++ {
-		linki := fmt.Sprintf(tc.origDir+"/link%d", i)
+		linki := fmt.Sprintf(tc.origDir+"/x/link%d", i)
 		if err := syscall.Unlink(linki); err != nil {
 			t.Fatal(err)
 		}
 	}
 	// Try to open link0 via mntDir
+	t.Log("open link0")
 	fd, err := syscall.Open(link0, syscall.O_RDONLY, 0)
 	if err != nil {
 		t.Error(err)
@@ -671,4 +855,108 @@ func TestStaleHardlinks(t *testing.T) {
 
 func init() {
 	syscall.Umask(0)
+}
+
+func testMountDir(t *testing.T, dir string) error {
+	opts := &Options{}
+	opts.Debug = testutil.VerboseTest()
+	opts.PanicHandler = testutil.PanicHandler(t, fuse.EIO)
+	server, err := Mount(dir, &Inode{}, opts)
+	if err != nil {
+		return err
+	}
+
+	server.Unmount()
+	server.Wait()
+	return nil
+}
+
+func TestParallelMount(t *testing.T) {
+	before := runtime.GOMAXPROCS(1)
+	defer runtime.GOMAXPROCS(before)
+	// Per default, only 1000 FUSE mounts are allowed, then you get
+	// > /usr/bin/fusermount3: too many FUSE filesystems mounted; mount_max=N can be set in /etc/fuse.conf
+	// Let's stay well below 1000.
+	N := 100
+	todo := make(chan string, N)
+	result := make(chan error, N)
+	for i := 0; i < N; i++ {
+		todo <- t.TempDir()
+	}
+	close(todo)
+
+	P := 2
+	for i := 0; i < P; i++ {
+		go func() {
+			for d := range todo {
+				result <- testMountDir(t, d)
+			}
+		}()
+	}
+
+	for i := 0; i < N; i++ {
+		e := <-result
+		if e != nil {
+			t.Error(e)
+		}
+	}
+}
+
+type handleLessCreateNode struct {
+	Inode
+}
+
+var _ = (NodeCreater)((*handleLessCreateNode)(nil))
+
+func (n *handleLessCreateNode) Create(ctx context.Context, name string, flags uint32, mode uint32, out *fuse.EntryOut) (node *Inode, fh FileHandle, fuseFlags uint32, errno syscall.Errno) {
+	f := &MemRegularFile{
+		Attr: fuse.Attr{
+			Mode: mode,
+		},
+	}
+	ch := n.NewPersistentInode(ctx, f, StableAttr{Mode: fuse.S_IFREG})
+	n.AddChild(name, ch, true)
+	return ch, nil, fuse.FOPEN_KEEP_CACHE, 0
+}
+
+func TestHandleLessCreate(t *testing.T) {
+	hlcn := &handleLessCreateNode{}
+	dir, _ := testMount(t, hlcn, nil)
+
+	posixtest.FileBasic(t, dir)
+}
+
+func TestMknodByCreate(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("mknod(2) makes regular files only on Linux")
+	}
+	dir, _ := testMount(t, &handleLessCreateNode{}, nil)
+
+	fn := filepath.Join(dir, "file")
+	if err := syscall.Mknod(fn, syscall.S_IFREG|0644, 0); err != nil {
+		t.Fatalf("Mknod: %v", err)
+	}
+	var st syscall.Stat_t
+	if err := syscall.Lstat(fn, &st); err != nil {
+		t.Fatalf("Lstat: %v", err)
+	}
+	if st.Mode&syscall.S_IFMT != syscall.S_IFREG {
+		t.Errorf("got mode %o, want regular file", st.Mode)
+	}
+	if err := os.WriteFile(fn, []byte("hello"), 0644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+}
+
+// A dangling symlink should not cause lchown to fail with ENOENT.
+// This is used in apt-get install.
+func TestLChown(t *testing.T) {
+	tc := newTestCase(t, &testOptions{})
+	if err := os.Symlink("doesnotexist", tc.origDir+"/link"); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.Lchown(tc.mntDir+"/link", os.Getuid(), os.Getgid()); err != nil {
+		t.Fatal(err)
+	}
 }

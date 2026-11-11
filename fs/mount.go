@@ -5,7 +5,8 @@
 package fs
 
 import (
-	"time"
+	"errors"
+	"runtime"
 
 	"github.com/hanwen/go-fuse/v2/fuse"
 )
@@ -15,16 +16,16 @@ import (
 // fuse.NewServer.  If nil is given as options, default settings are
 // applied, which are 1 second entry and attribute timeout.
 func Mount(dir string, root InodeEmbedder, options *Options) (*fuse.Server, error) {
-	if options == nil {
-		oneSec := time.Second
-		options = &Options{
-			EntryTimeout: &oneSec,
-			AttrTimeout:  &oneSec,
-		}
+	if runtime.GOOS == "openbsd" && options != nil && options.NegativeTimeout != nil && *options.NegativeTimeout > 0 {
+		// fuse(4) fails a create after a negative entry.
+		return nil, errors.New("fs: NegativeTimeout is not supported on OpenBSD")
 	}
-
 	rawFS := NewNodeFS(root, options)
-	server, err := fuse.NewServer(rawFS, dir, &options.MountOptions)
+	var mountOptions *fuse.MountOptions
+	if options != nil {
+		mountOptions = &options.MountOptions
+	}
+	server, err := fuse.NewServer(rawFS, dir, mountOptions)
 	if err != nil {
 		return nil, err
 	}
